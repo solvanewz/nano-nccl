@@ -115,6 +115,22 @@ if(NANO_NCCL_ENABLE_MPI)
     add_executable(nano_nccl_mpi_native_api mpi_native_api.cu)
     target_link_libraries(nano_nccl_mpi_native_api PRIVATE nano_nccl_mpi MPI::MPI_C)
 
+    # EP peer exchange over ShmWire; one process per rank, ranks may share a GPU.
+    add_executable(nano_nccl_peer_shm_wire_test peer_shm_wire_test.cc)
+    target_link_libraries(nano_nccl_peer_shm_wire_test PRIVATE nano_nccl_peer_shm)
+    target_compile_options(nano_nccl_peer_shm_wire_test PRIVATE -O2 -Wall -Wextra)
+    if(BUILD_TESTING)
+        foreach(np IN ITEMS 2 4)
+            add_test(
+                NAME nano_nccl_peer_shm_wire_np${np}
+                COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${np}
+                        --bind-to none --mca btl ^openib
+                        $<TARGET_FILE:nano_nccl_peer_shm_wire_test>
+            )
+            set_tests_properties(nano_nccl_peer_shm_wire_np${np} PROPERTIES TIMEOUT 900)
+        endforeach()
+    endif()
+
     add_executable(nano_nccl_mpi_device_selection mpi_device_selection.cc)
     target_link_libraries(nano_nccl_mpi_device_selection PRIVATE
         nano_nccl_mpi MPI::MPI_C)

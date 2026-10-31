@@ -17,8 +17,8 @@ namespace nano_nccl::transport::peer {
 //   released(dst) on src: dst has freed the slots of chunks [0, released).
 // A sender may write chunk `seq` only while seq - released < slots.
 //
-// Implementations: the CPU loopback fabric (tests) and, next, host-staged
-// shared memory for the A40 pair.
+// Implementations: the CPU loopback fabric (tests) and ShmWire (host-staged
+// POSIX shared memory between processes on one host).
 class PeerWire {
 public:
     using OpId = std::uint64_t;
@@ -52,6 +52,11 @@ public:
     virtual void release(int src, std::uint64_t upto) = 0;
 
     virtual bool done(OpId op) = 0;
+
+    // Non-blocking. Lets a wire with asynchronous work of its own (for
+    // example publishing arrivals once a DMA finishes) advance it.
+    // PeerExchanger::progress() calls it first.
+    virtual void progress() {}
 };
 
 }  // namespace nano_nccl::transport::peer

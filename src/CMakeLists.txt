@@ -94,6 +94,18 @@ if(NANO_NCCL_ENABLE_MPI)
     target_compile_definitions(nano_nccl_mpi PUBLIC OMPI_SKIP_MPICXX)
     target_link_libraries(nano_nccl_mpi PUBLIC nano_nccl MPI::MPI_C)
 
+    # EP peer exchange over host-staged shared memory (B1); no CUDA peer access.
+    add_library(nano_nccl_peer_shm STATIC transport/peer/shm_wire.cc)
+    set_target_properties(nano_nccl_peer_shm PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(nano_nccl_peer_shm PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${nano_nccl_mpi_include_dirs}
+    )
+    target_compile_options(nano_nccl_peer_shm PRIVATE -O2 -Wall -Wextra)
+    target_compile_definitions(nano_nccl_peer_shm PUBLIC OMPI_SKIP_MPICXX)
+    target_link_libraries(nano_nccl_peer_shm PUBLIC nano_nccl_peer CUDA::cudart MPI::MPI_C)
+
     add_library(nano_nccl_mpi_c SHARED
         collective/all_reduce/mpi_c_api.cc
     )

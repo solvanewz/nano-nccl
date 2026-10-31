@@ -72,6 +72,8 @@ ExchangeId PeerExchanger::exchangev_async(std::uint64_t epoch, std::uint32_t tag
 }
 
 void PeerExchanger::progress() {
+    wire_->progress();
+
     // Post round-robin, one chunk per link per pass, so a long message on one
     // link does not monopolize the wire.
     bool posted = true;
