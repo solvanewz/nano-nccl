@@ -77,32 +77,24 @@ void ExpertFfn::gemm(const bf16* a, const bf16* b, bf16* c, std::int64_t m, int 
                  "cublasGemmEx");
 }
 
-void ExpertFfn::forward(bf16* rows, const std::vector<std::int64_t>& expert_offsets, cudaStream_t stream) {
-    if (static_cast<int>(expert_offsets.size()) != local_experts_ + 1) {
-        throw std::invalid_argument("ExpertFfn::forward: expert_offsets has the wrong size");
+void ExpertFfn::forward(bf16* rows, const std::vector<ExpertSegment>& segments, cudaStream_t stream) {
+    for (const ExpertSegment& seg : segments) {
+        if (seg.expert < 0 || seg.expert >= local_experts_ || seg.begin < 0 || seg.rows < 0 ||
+            seg.begin + seg.rows > max_rows_) {
+            throw std::invalid_argument("ExpertFfn::forward: segment for expert " + std::to_string(seg.expert) +
+                                        " rows [" + std::to_string(seg.begin) + ", " +
+                                        std::to_string(seg.begin + seg.rows) + ") is outside capacity " +
+                                        std::to_string(max_rows_));
+        }
     }
-    const std::int64_t total = expert_offsets.back();
-    if (total > max_rows_) {
-        throw std::length_error("ExpertFfn::forward: " + std::to_string(total) + " rows exceed capacity " +
-                                std::to_string(max_rows_));
-    }
-    if (total == 0) return;
     CUDA_CHECK_THROW(cudaSetDevice(device_));
     cublas_check(cublasSetStream(handle_, stream), "cublasSetStream");
-    for (int j = 0; j < local_experts_; ++j) {
-        const std::int64_t begin = expert_offsets[j];
-        const std::int64_t m = expert_offsets[j + 1] - begin;
-        if (m == 0) continue;
-        gemm(rows + begin * hidden_, w13(j), h_ + begin * 2 * ffn_, m, 2 * ffn_, hidden_);
-    }
-    launch_swiglu(h_, total, ffn_, a_, stream);
-    // Every first GEMM precedes the second ones in stream order, so the
-    // outputs can overwrite the inputs.
-    for (int j = 0; j < local_experts_; ++j) {
-        const std::int64_t begin = expert_offsets[j];
-        const std::int64_t m = expert_offsets[j + 1] - begin;
-        if (m == 0) continue;
-        gemm(a_ + begin * ffn_, w2(j), rows + begin * hidden_, m, hidden_, ffn_);
+    // The workspace rows mirror the expert-major rows, so segments never share them.
+    for (const ExpertSegment& seg : segments) {
+        if (seg.rows == 0) continue;
+        gemm(rows + seg.begin * hidden_, w13(seg.expert), h_ + seg.begin * 2 * ffn_, seg.rows, 2 * ffn_, hidden_);
+        launch_swiglu(h_ + seg.begin * 2 * ffn_, seg.rows, ffn_, a_ + seg.begin * ffn_, stream);
+        gemm(a_ + seg.begin * ffn_, w2(seg.expert), rows + seg.begin * hidden_, seg.rows, hidden_, ffn_);
     }
 }
 

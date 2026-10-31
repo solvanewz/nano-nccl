@@ -16,13 +16,29 @@ void validate_shape(const EpShape& s) {
     if (s.ffn < 0) fail("ffn must not be negative");
 }
 
-DispatchPlan make_dispatch_plan(const EpShape& shape, const std::vector<std::int64_t>& send_counts,
-                                const std::vector<std::int64_t>& recv_counts) {
+std::vector<std::int32_t> send_expert_order(const EpShape& shape, const planner::GroupPlan& groups) {
     validate_shape(shape);
+    planner::validate_group_plan(groups, shape.num_experts);
+    std::vector<std::int32_t> order;
+    order.reserve(static_cast<std::size_t>(shape.num_experts));
+    for (int g : groups.order) {
+        for (int e = 0; e < shape.num_experts; ++e) {
+            if (groups.expert_group[e] == g) order.push_back(e);
+        }
+    }
+    return order;
+}
+
+DispatchPlan make_dispatch_plan(const EpShape& shape, const planner::GroupPlan& groups,
+                                const std::vector<std::int64_t>& send_counts,
+                                const std::vector<std::int64_t>& recv_counts) {
     const int W = shape.world;
     const int E = shape.num_experts;
     const int epr = shape.experts_per_rank();
     const auto rb = static_cast<std::int64_t>(shape.row_bytes());
+
+    DispatchPlan p;
+    p.expert_order = send_expert_order(shape, groups);  // validates shape and plan
     if (static_cast<int>(send_counts.size()) != E || static_cast<int>(recv_counts.size()) != W * epr) {
         throw std::invalid_argument("make_dispatch_plan: count vectors have the wrong size");
     }
@@ -32,58 +48,82 @@ DispatchPlan make_dispatch_plan(const EpShape& shape, const std::vector<std::int
     for (std::int64_t c : recv_counts) {
         if (c < 0) throw std::invalid_argument("make_dispatch_plan: negative receive count");
     }
-
-    DispatchPlan p;
     p.send_counts = send_counts;
-    p.send_offsets.assign(static_cast<std::size_t>(E) + 1, 0);
-    for (int e = 0; e < E; ++e) p.send_offsets[e + 1] = p.send_offsets[e] + send_counts[e];
-    p.send_rows = p.send_offsets[E];
-
     p.recv_counts = recv_counts;
-    p.recv_offsets.assign(static_cast<std::size_t>(W) * epr, 0);
-    std::int64_t row = 0;
-    for (int i = 0; i < W * epr; ++i) {
-        p.recv_offsets[i] = row;
-        row += recv_counts[i];
-    }
-    p.recv_rows = row;
+    p.send_offsets.assign(static_cast<std::size_t>(E), 0);
 
-    p.expert_offsets.assign(static_cast<std::size_t>(epr) + 1, 0);
-    for (int j = 0; j < epr; ++j) {
-        std::int64_t rows = 0;
-        for (int s = 0; s < W; ++s) rows += recv_counts[s * epr + j];
-        p.expert_offsets[j + 1] = p.expert_offsets[j] + rows;
-    }
+    auto bytes = [rb](std::int64_t rows) { return static_cast<std::size_t>(rows * rb); };
+    std::int64_t send_cursor = 0, recv_cursor = 0, expert_cursor = 0;
+    std::vector<std::int64_t> recv_row(static_cast<std::size_t>(W) * epr, 0);  // [s * epr + j]
 
-    auto& d = p.dispatch;
-    d.send_bytes.assign(W, 0);
-    d.send_offsets.assign(W, 0);
-    d.recv_bytes.assign(W, 0);
-    d.recv_offsets.assign(W, 0);
-    for (int peer = 0; peer < W; ++peer) {
-        const std::int64_t first = p.send_offsets[peer * epr];
-        const std::int64_t last = p.send_offsets[(peer + 1) * epr];
-        d.send_offsets[peer] = static_cast<std::size_t>(first * rb);
-        d.send_bytes[peer] = static_cast<std::size_t>((last - first) * rb);
-        std::int64_t rows = 0;
-        for (int j = 0; j < epr; ++j) rows += recv_counts[peer * epr + j];
-        d.recv_offsets[peer] = static_cast<std::size_t>(p.recv_offsets[peer * epr] * rb);
-        d.recv_bytes[peer] = static_cast<std::size_t>(rows * rb);
-    }
-    p.combine = {d.recv_bytes, d.recv_offsets, d.send_bytes, d.send_offsets};
+    for (int g : groups.order) {
+        GroupStep st;
+        st.group = g;
+        auto& d = st.dispatch;
+        d.send_bytes.assign(W, 0);
+        d.send_offsets.assign(W, 0);
+        d.recv_bytes.assign(W, 0);
+        d.recv_offsets.assign(W, 0);
 
-    for (int j = 0; j < epr; ++j) {
-        std::int64_t dst = p.expert_offsets[j];
-        for (int s = 0; s < W; ++s) {
-            const std::int64_t rows = recv_counts[s * epr + j];
-            if (rows != 0) {
-                const std::int64_t src = p.recv_offsets[s * epr + j];
-                p.unpack.push_back({src, dst, rows});
-                p.repack.push_back({dst, src, rows});
+        // Send side: experts of g in id order, hence grouped by owner.
+        st.send_begin = send_cursor;
+        for (int peer = 0; peer < W; ++peer) d.send_offsets[peer] = bytes(send_cursor);
+        int last_peer = -1;
+        for (int e = 0; e < E; ++e) {
+            if (groups.expert_group[e] != g) continue;
+            const int peer = shape.owner(e);
+            if (peer != last_peer) {
+                // Peers without experts in g keep a zero-byte message at the
+                // current position.
+                for (int q = last_peer + 1; q <= peer; ++q) d.send_offsets[q] = bytes(send_cursor);
+                last_peer = peer;
             }
-            dst += rows;
+            p.send_offsets[e] = send_cursor;
+            d.send_bytes[peer] += bytes(send_counts[e]);
+            send_cursor += send_counts[e];
         }
+        for (int q = last_peer + 1; q < W; ++q) d.send_offsets[q] = bytes(send_cursor);
+        st.send_rows = send_cursor - st.send_begin;
+
+        // Receive side: this rank's experts of g, by source then expert.
+        std::vector<int> local;
+        for (int j = 0; j < epr; ++j) {
+            if (groups.expert_group[shape.first_local_expert() + j] == g) local.push_back(j);
+        }
+        st.recv_begin = recv_cursor;
+        for (int s = 0; s < W; ++s) {
+            d.recv_offsets[s] = bytes(recv_cursor);
+            for (int j : local) {
+                recv_row[s * epr + j] = recv_cursor;
+                d.recv_bytes[s] += bytes(recv_counts[s * epr + j]);
+                recv_cursor += recv_counts[s * epr + j];
+            }
+        }
+        st.recv_rows = recv_cursor - st.recv_begin;
+
+        st.expert_begin = expert_cursor;
+        for (int j : local) {
+            ExpertSegment seg;
+            seg.expert = j;
+            seg.begin = expert_cursor;
+            for (int s = 0; s < W; ++s) {
+                const std::int64_t rows = recv_counts[s * epr + j];
+                if (rows != 0) {
+                    st.unpack.push_back({recv_row[s * epr + j], expert_cursor, rows});
+                    st.repack.push_back({expert_cursor, recv_row[s * epr + j], rows});
+                }
+                expert_cursor += rows;
+            }
+            seg.rows = expert_cursor - seg.begin;
+            st.experts.push_back(seg);
+        }
+        st.expert_rows = expert_cursor - st.expert_begin;
+
+        st.combine = {d.recv_bytes, d.recv_offsets, d.send_bytes, d.send_offsets};
+        p.steps.push_back(std::move(st));
     }
+    p.send_rows = send_cursor;
+    p.recv_rows = recv_cursor;
     return p;
 }
 

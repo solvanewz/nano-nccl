@@ -30,9 +30,10 @@ public:
     int hidden() const { return hidden_; }
     int ffn() const { return ffn_; }
 
-    // `rows` is expert-major; expert j owns rows [expert_offsets[j], expert_offsets[j + 1]).
-    // Outputs overwrite the inputs in place. Asynchronous on `stream`.
-    void forward(bf16* rows, const std::vector<std::int64_t>& expert_offsets, cudaStream_t stream);
+    // Runs local expert `seg.expert` on rows [seg.begin, seg.begin + seg.rows)
+    // of the expert-major buffer `rows`, for every segment; the segments must
+    // not overlap. Outputs overwrite the inputs in place. Asynchronous on `stream`.
+    void forward(bf16* rows, const std::vector<ExpertSegment>& segments, cudaStream_t stream);
 
 private:
     void gemm(const bf16* a, const bf16* b, bf16* c, std::int64_t m, int n, int k);

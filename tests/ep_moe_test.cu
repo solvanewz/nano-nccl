@@ -1,14 +1,23 @@
 // EP MoE layer over ShmWire (B1), one process per rank under mpirun.
 //
-//   ep_moe_test [--slots S] [--slot-bytes B]
+//   ep_moe_test [--slots S] [--slot-bytes B] [--copy-delay-us D]
 //       probe matrix: experts scale rows by powers of two, so every output
 //       is checked bit-exactly against a host reference. Covers skewed
 //       routing, ranks with no tokens, all tokens routed to one rank's
-//       experts, unequal token counts, and several forwards per layer.
+//       experts, unequal token counts, and several forwards per layer, each
+//       under several group plans and pipeline schedules (serial, fixed
+//       groups with and without overlap, all dispatches ahead, and an
+//       arbitrary expert->group mapping run in reverse order). D slows every
+//       ShmWire copy (ShmWireConfig::debug_copy_delay_us), so data used
+//       before it is readable shows up as wrong output.
 //   ep_moe_test --ffn [--tokens T --experts E --topk K --hidden H --ffn-dim F
-//                      --iters N --skew X --dump DIR]
-//       real BF16 SwiGLU experts; prints per-stage times. With --dump, writes
-//       inputs, weights and outputs for tests/ep_moe_reference.py.
+//                      --iters N --skew X --groups G --lookahead L
+//                      --no-overlap --dump DIR]
+//       real BF16 SwiGLU experts with the B1 fixed group plan; prints stage
+//       times and the step timeline, and checks that the output is
+//       bit-identical to a serial (one group, no overlap) forward. With
+//       --dump, writes inputs, weights and outputs for
+//       tests/ep_moe_reference.py.
 #include "ep/moe_layer.h"
 #include "transport/peer/peer_exchanger.h"
 #include "transport/peer/shm_wire.h"
@@ -37,7 +46,9 @@ using nano_nccl::ep::ExpertFfn;
 using nano_nccl::ep::ExpertMode;
 using nano_nccl::ep::MoeLayer;
 using nano_nccl::ep::MoeLayerConfig;
-using nano_nccl::ep::StageTimes;
+using nano_nccl::ep::ForwardTimes;
+using nano_nccl::ep::PipelineOptions;
+using nano_nccl::planner::GroupPlan;
 using nano_nccl::ep::probe_scale;
 using nano_nccl::transport::peer::PeerExchanger;
 using nano_nccl::transport::peer::ShmWire;
@@ -133,8 +144,40 @@ int tokens_of(const ProbeCase& c, int rank) {
     return c.base_tokens + rank * c.step_tokens;
 }
 
+struct Variant {
+    const char* name;
+    int groups;      // 0: one group per local expert
+    bool overlap;
+    int lookahead;
+    bool scrambled;  // arbitrary expert -> group mapping, groups run in reverse
+};
+
+constexpr Variant kVariants[] = {
+    {"serial", 1, false, 0, false},
+    {"g2_overlap", 2, true, 1, false},
+    {"gmax_overlap", 0, true, 1, false},
+    {"gmax_no_overlap", 0, false, 0, false},
+    {"gmax_all_ahead", 0, true, 64, false},
+    {"scrambled_l0", 3, true, 0, true},
+};
+
+// Identical on every rank: deterministic in the shape.
+GroupPlan make_group_plan(const EpShape& s, const Variant& v) {
+    const int epr = s.experts_per_rank();
+    if (!v.scrambled) {
+        const int groups = std::min(v.groups == 0 ? epr : v.groups, epr);
+        return nano_nccl::planner::fixed_group_plan(s.world, s.num_experts, groups);
+    }
+    const int groups = std::min(v.groups, s.num_experts);
+    std::mt19937_64 rng(static_cast<std::uint64_t>(s.num_experts) * 31 + s.top_k);
+    GroupPlan plan;
+    for (int e = 0; e < s.num_experts; ++e) plan.expert_group.push_back(static_cast<int>(rng() % groups));
+    for (int g = groups - 1; g >= 0; --g) plan.order.push_back(g);
+    return plan;
+}
+
 // Returns the number of output values checked on this rank.
-std::uint64_t run_probe_case(const ProbeCase& c, std::uint64_t* epoch) {
+std::uint64_t run_probe_case(const ProbeCase& c, const Variant& variant, std::uint64_t* epoch) {
     EpShape s{g_world, g_rank, c.experts_per_rank * g_world, c.top_k, c.hidden, 0};
     int max_tokens = 0;
     for (int r = 0; r < g_world; ++r) max_tokens = std::max(max_tokens, tokens_of(c, r));
@@ -142,6 +185,8 @@ std::uint64_t run_probe_case(const ProbeCase& c, std::uint64_t* epoch) {
     MoeLayer layer(*g_exchanger, cfg, nullptr, g_device);
     cudaStream_t stream;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    const GroupPlan plan = make_group_plan(s, variant);
+    const PipelineOptions options{variant.overlap, variant.lookahead};
     std::uint64_t checked = 0;
     for (int iter = 0; iter < 3; ++iter) {
         // Different token counts per iteration so stale rows would show up.
@@ -156,7 +201,7 @@ std::uint64_t run_probe_case(const ProbeCase& c, std::uint64_t* epoch) {
         dids.upload(routing.ids);
         dw.upload(routing.weights);
         cuda_check(cudaMemset(dout.ptr, 0xFF, std::max<std::size_t>(x.size(), 1) * sizeof(bf16)), "memset");
-        layer.forward((*epoch)++, dx.ptr, tokens, dids.ptr, dw.ptr, dout.ptr, stream);
+        layer.forward((*epoch)++, dx.ptr, tokens, dids.ptr, dw.ptr, dout.ptr, plan, options, stream);
         const auto out = dout.download(x.size());
         for (int t = 0; t < tokens; ++t) {
             for (int h = 0; h < c.hidden; ++h) {
@@ -170,7 +215,8 @@ std::uint64_t run_probe_case(const ProbeCase& c, std::uint64_t* epoch) {
                 const bf16 want = __float2bfloat16_rn(acc);
                 const bf16 got = out[t * c.hidden + h];
                 if (std::memcmp(&want, &got, sizeof(bf16)) != 0) {
-                    throw std::runtime_error(std::string(c.name) + " iter " + std::to_string(iter) + ": token " +
+                    throw std::runtime_error(std::string(c.name) + "/" + variant.name + " iter " +
+                                             std::to_string(iter) + ": token " +
                                              std::to_string(t) + " col " + std::to_string(h) + " got " +
                                              std::to_string(__bfloat162float(got)) + " want " +
                                              std::to_string(__bfloat162float(want)));
@@ -194,24 +240,28 @@ int run_probe() {
         {"wide_rows", 2, 2, 4096, 0.5, -1, 200, 50, -1},
     };
     std::uint64_t epoch = 1, checked = 0;
+    int runs = 0;
     for (const ProbeCase& c : cases) {
-        try {
-            checked += run_probe_case(c, &epoch);
-        } catch (const std::exception& error) {
-            std::printf("FAIL rank %d probe %s: %s\n", g_rank, c.name, error.what());
-            std::fflush(stdout);
-            MPI_Abort(MPI_COMM_WORLD, 1);
+        for (const Variant& v : kVariants) {
+            try {
+                checked += run_probe_case(c, v, &epoch);
+            } catch (const std::exception& error) {
+                std::printf("FAIL rank %d probe %s/%s: %s\n", g_rank, c.name, v.name, error.what());
+                std::fflush(stdout);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            ++runs;
         }
         MPI_Barrier(MPI_COMM_WORLD);
         if (g_rank == 0) {
-            std::printf("PASS probe %s\n", c.name);
+            std::printf("PASS probe %s (%zu plans)\n", c.name, sizeof(kVariants) / sizeof(kVariants[0]));
             std::fflush(stdout);
         }
     }
     std::uint64_t all = 0;
     MPI_Reduce(&checked, &all, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
     if (g_rank == 0) {
-        std::printf("probe: %zu cases, %llu output values bit-exact\n", sizeof(cases) / sizeof(cases[0]),
+        std::printf("probe: %d case x plan runs, %llu output values bit-exact\n", runs,
                     static_cast<unsigned long long>(all));
         std::printf("ep_moe_probe=PASS\n");
     }
@@ -234,6 +284,9 @@ struct FfnArgs {
     int ffn = 2048;
     int iters = 10;
     double skew = 0.0;
+    int groups = 1;
+    int lookahead = 1;
+    bool overlap = true;
     std::string dump;
 };
 
@@ -265,41 +318,64 @@ int run_ffn(const FfnArgs& a) {
     cudaStream_t stream;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
 
-    StageTimes sum;
+    const GroupPlan plan = nano_nccl::planner::fixed_group_plan(g_world, a.experts, a.groups);
+    const PipelineOptions options{a.overlap, a.lookahead};
+    constexpr int kStages = 5;
+    double sum[kStages] = {};
+    ForwardTimes last;
     const int warmup = 2;
+    std::uint64_t epoch = 1;
     for (int it = 0; it < warmup + a.iters; ++it) {
         MPI_Barrier(MPI_COMM_WORLD);
-        const StageTimes t = layer.forward(static_cast<std::uint64_t>(it + 1), dx.ptr, a.tokens, dids.ptr, dw.ptr,
-                                           dout.ptr, stream);
+        const ForwardTimes t =
+            layer.forward(epoch++, dx.ptr, a.tokens, dids.ptr, dw.ptr, dout.ptr, plan, options, stream);
         if (it < warmup) continue;
-        sum.route += t.route;
-        sum.counts += t.counts;
-        sum.dispatch += t.dispatch;
-        sum.expert += t.expert;
-        sum.combine += t.combine;
-        sum.reduce += t.reduce;
-        sum.total += t.total;
+        const double v[kStages] = {t.route, t.counts, t.pipeline, t.reduce, t.total};
+        for (int i = 0; i < kStages; ++i) sum[i] += v[i];
+        last = t;
     }
-    double local[7] = {sum.route, sum.counts, sum.dispatch, sum.expert, sum.combine, sum.reduce, sum.total};
-    double slowest[7];
-    MPI_Reduce(local, slowest, 7, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    double slowest[kStages];
+    MPI_Reduce(sum, slowest, kStages, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     std::int64_t recv_rows = layer.last_plan().recv_rows, max_recv = 0, min_recv = 0;
     MPI_Reduce(&recv_rows, &max_recv, 1, MPI_INT64_T, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&recv_rows, &min_recv, 1, MPI_INT64_T, MPI_MIN, 0, MPI_COMM_WORLD);
+
+    // Grouping and overlap must not change a single output bit.
+    const auto pipelined = dout.download(x.size());
+    MPI_Barrier(MPI_COMM_WORLD);
+    layer.forward(epoch++, dx.ptr, a.tokens, dids.ptr, dw.ptr, dout.ptr,
+                  nano_nccl::planner::fixed_group_plan(g_world, a.experts, 1), PipelineOptions{false, 0}, stream);
+    const auto serial = dout.download(x.size());
+    int same = std::memcmp(pipelined.data(), serial.data(), x.size() * sizeof(bf16)) == 0 ? 1 : 0, all_same = 0;
+    MPI_Allreduce(&same, &all_same, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+
     if (g_rank == 0) {
-        std::printf("# EP MoE serial: ranks=%d tokens/rank=%d experts=%d top_k=%d hidden=%d ffn=%d skew=%.2f\n",
-                    g_world, a.tokens, a.experts, a.top_k, a.hidden, a.ffn, a.skew);
+        std::printf("# EP MoE: ranks=%d tokens/rank=%d experts=%d top_k=%d hidden=%d ffn=%d skew=%.2f "
+                    "groups=%d overlap=%d lookahead=%d\n",
+                    g_world, a.tokens, a.experts, a.top_k, a.hidden, a.ffn, a.skew, a.groups, a.overlap ? 1 : 0,
+                    a.lookahead);
         std::printf("# expert rows per rank: min %lld max %lld\n", static_cast<long long>(min_recv),
                     static_cast<long long>(max_recv));
-        const char* names[7] = {"route", "counts", "dispatch", "expert", "combine", "reduce", "total"};
+        const char* names[kStages] = {"route", "counts", "pipeline", "reduce", "total"};
         std::printf("# stage times, us (mean over %d iters, slowest rank per stage)\n", a.iters);
-        for (int i = 0; i < 7; ++i) std::printf("  %-9s %10.1f\n", names[i], slowest[i] / a.iters);
+        for (int i = 0; i < kStages; ++i) std::printf("  %-9s %10.1f\n", names[i], slowest[i] / a.iters);
+        std::printf("# rank 0 step timeline of the last iteration, us since forward start\n");
+        std::printf("  %4s %5s %7s %9s %9s %9s %9s %9s %9s\n", "step", "group", "rows", "D_issue", "D_ready",
+                    "E_launch", "E_done", "C_issue", "C_ready");
+        for (std::size_t i = 0; i < last.steps.size(); ++i) {
+            const auto& t = last.steps[i];
+            std::printf("  %4zu %5d %7lld %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f\n", i, t.group,
+                        static_cast<long long>(t.expert_rows), t.dispatch_issued, t.dispatch_readable,
+                        t.expert_launched, t.expert_done, t.combine_issued, t.combine_readable);
+        }
+        std::printf("bitwise identical to serial: %s\n", all_same ? "yes" : "NO");
     }
+    if (!all_same) throw std::runtime_error("pipelined output differs from the serial forward");
 
     if (!a.dump.empty()) {
         const std::string p = a.dump + "/";
         const std::string r = std::to_string(g_rank);
-        const auto out = dout.download(x.size());
+        const auto& out = pipelined;
         write_file(p + "x_" + r + ".bin", x.data(), x.size() * sizeof(bf16));
         write_file(p + "ids_" + r + ".bin", routing.ids.data(), routing.ids.size() * sizeof(std::int32_t));
         write_file(p + "weights_" + r + ".bin", routing.weights.data(), routing.weights.size() * sizeof(float));
@@ -343,6 +419,7 @@ int main(int argc, char** argv) {
 
         bool ffn_mode = false;
         int slots = 4;
+        int copy_delay_us = 0;
         std::size_t slot_bytes = std::size_t{1} << 20;
         FfnArgs a;
         for (int i = 1; i < argc; ++i) {
@@ -354,6 +431,7 @@ int main(int argc, char** argv) {
             if (arg == "--ffn") ffn_mode = true;
             else if (arg == "--slots") slots = std::atoi(next());
             else if (arg == "--slot-bytes") slot_bytes = std::strtoull(next(), nullptr, 0);
+            else if (arg == "--copy-delay-us") copy_delay_us = std::atoi(next());
             else if (arg == "--tokens") a.tokens = std::atoi(next());
             else if (arg == "--experts") a.experts = std::atoi(next());
             else if (arg == "--topk") a.top_k = std::atoi(next());
@@ -362,9 +440,12 @@ int main(int argc, char** argv) {
             else if (arg == "--iters") a.iters = std::atoi(next());
             else if (arg == "--skew") a.skew = std::atof(next());
             else if (arg == "--dump") a.dump = next();
+            else if (arg == "--groups") a.groups = std::atoi(next());
+            else if (arg == "--lookahead") a.lookahead = std::atoi(next());
+            else if (arg == "--no-overlap") a.overlap = false;
             else throw std::invalid_argument("unknown argument " + arg);
         }
-        ShmWire wire(MPI_COMM_WORLD, {slots, slot_bytes, g_device});
+        ShmWire wire(MPI_COMM_WORLD, {slots, slot_bytes, g_device, copy_delay_us});
         g_exchanger = std::make_unique<PeerExchanger>(&wire);
         status = ffn_mode ? run_ffn(a) : run_probe();
         MPI_Barrier(MPI_COMM_WORLD);  // peers may still read this rank's region

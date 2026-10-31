@@ -1,0 +1,222 @@
+// CPU test of the EP row plan (src/ep/ep_plan) and group plans
+// (src/planner): for random shapes, group plans and count matrices it builds
+// every rank's DispatchPlan and simulates the whole layer on row tags:
+// pack -> per step dispatch -> unpack -> "experts" -> repack -> combine.
+// Checks that both ends of every message agree on its size, that every row
+// reaches its expert exactly once and in a deterministic order, that every
+// layout passes the exchanger's validation, and that every row returns to the
+// position it was sent from.
+#include "ep/ep_plan.h"
+#include "planner/group_plan.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <exception>
+#include <numeric>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+using nano_nccl::ep::DispatchPlan;
+using nano_nccl::ep::EpShape;
+using nano_nccl::planner::GroupPlan;
+
+struct Tag {
+    int src = -1;
+    int expert = -1;
+    std::int64_t index = -1;  // row index within (src, expert)
+    int visits = 0;           // times an expert processed this row
+    bool operator==(const Tag& o) const { return src == o.src && expert == o.expert && index == o.index; }
+};
+
+void require(bool ok, const std::string& what) {
+    if (!ok) throw std::runtime_error(what);
+}
+
+// Copies `bytes` (whole rows) between row buffers.
+void copy_rows(const std::vector<Tag>& src, std::size_t src_off, std::vector<Tag>& dst, std::size_t dst_off,
+               std::size_t bytes, std::size_t rb, const std::string& what) {
+    require(bytes % rb == 0 && src_off % rb == 0 && dst_off % rb == 0, what + ": not row aligned");
+    const std::size_t rows = bytes / rb;
+    require(src_off / rb + rows <= src.size() && dst_off / rb + rows <= dst.size(), what + ": out of bounds");
+    for (std::size_t i = 0; i < rows; ++i) {
+        Tag& d = dst[dst_off / rb + i];
+        require(d.src == -1, what + ": row written twice");
+        d = src[src_off / rb + i];
+    }
+}
+
+GroupPlan random_plan(std::mt19937_64& rng, int world, int experts) {
+    if (rng() % 2 == 0) {
+        const int per_rank = experts / world;
+        return nano_nccl::planner::fixed_group_plan(world, experts, 1 + static_cast<int>(rng() % per_rank));
+    }
+    GroupPlan plan;
+    const int groups = 1 + static_cast<int>(rng() % (experts + 1));  // may leave groups empty
+    for (int e = 0; e < experts; ++e) plan.expert_group.push_back(static_cast<int>(rng() % groups));
+    plan.order.resize(groups);
+    std::iota(plan.order.begin(), plan.order.end(), 0);
+    std::shuffle(plan.order.begin(), plan.order.end(), rng);
+    return plan;
+}
+
+void run_trial(std::mt19937_64& rng, int trial) {
+    const int worlds[] = {1, 2, 3, 4, 8};
+    const int W = worlds[rng() % 5];
+    const int epr = 1 + static_cast<int>(rng() % 4);
+    const int E = W * epr;
+    const GroupPlan groups = random_plan(rng, W, E);
+    // N[s][e], with many zeros.
+    std::vector<std::vector<std::int64_t>> N(W, std::vector<std::int64_t>(E));
+    for (auto& row : N) {
+        for (auto& n : row) n = rng() % 3 == 0 ? 0 : static_cast<std::int64_t>(rng() % 6);
+    }
+
+    std::vector<EpShape> shapes;
+    std::vector<DispatchPlan> plans;
+    for (int r = 0; r < W; ++r) {
+        EpShape s{W, r, E, 1, 8, 0};
+        std::vector<std::int64_t> recv(static_cast<std::size_t>(W) * epr);
+        for (int src = 0; src < W; ++src) {
+            for (int j = 0; j < epr; ++j) recv[src * epr + j] = N[src][r * epr + j];
+        }
+        shapes.push_back(s);
+        plans.push_back(nano_nccl::ep::make_dispatch_plan(s, groups, N[r], recv));
+    }
+    const std::size_t rb = shapes[0].row_bytes();
+    const int steps = groups.groups();
+    const std::string where = "trial " + std::to_string(trial) + " (W=" + std::to_string(W) +
+                              " epr=" + std::to_string(epr) + " groups=" + std::to_string(steps) + ")";
+
+    // Pack: send rows tagged by (rank, expert, index).
+    std::vector<std::vector<Tag>> send(W), recv(W), expert(W), back(W), ret(W);
+    for (int r = 0; r < W; ++r) {
+        const DispatchPlan& p = plans[r];
+        require(static_cast<int>(p.steps.size()) == steps, where + ": step count");
+        send[r].assign(static_cast<std::size_t>(p.send_rows), Tag{});
+        for (int e = 0; e < E; ++e) {
+            for (std::int64_t i = 0; i < N[r][e]; ++i) {
+                Tag& t = send[r][static_cast<std::size_t>(p.send_offsets[e] + i)];
+                require(t.src == -1, where + ": send rows overlap");
+                t = {r, e, i, 0};
+            }
+        }
+        for (const Tag& t : send[r]) require(t.src != -1, where + ": send row unused");
+        recv[r].assign(static_cast<std::size_t>(p.recv_rows), Tag{});
+        expert[r].assign(static_cast<std::size_t>(p.recv_rows), Tag{});
+        back[r].assign(static_cast<std::size_t>(p.recv_rows), Tag{});
+        ret[r].assign(static_cast<std::size_t>(p.send_rows), Tag{});
+    }
+
+    for (int i = 0; i < steps; ++i) {
+        for (int r = 0; r < W; ++r) {
+            const auto& st = plans[r].steps[i];
+            require(st.group == groups.order[i], where + ": step order");
+            nano_nccl::transport::peer::validate_layout(st.dispatch, W);
+            nano_nccl::transport::peer::validate_layout(st.combine, W);
+        }
+        // Dispatch: r -> d.
+        for (int r = 0; r < W; ++r) {
+            for (int d = 0; d < W; ++d) {
+                const auto& out = plans[r].steps[i].dispatch;
+                const auto& in = plans[d].steps[i].dispatch;
+                require(out.send_bytes[d] == in.recv_bytes[r], where + ": dispatch size mismatch");
+                copy_rows(send[r], out.send_offsets[d], recv[d], in.recv_offsets[r], out.send_bytes[d], rb,
+                          where + " dispatch");
+            }
+        }
+        // Unpack, run "experts", repack.
+        for (int r = 0; r < W; ++r) {
+            const auto& st = plans[r].steps[i];
+            for (const auto& seg : st.unpack) {
+                for (std::int64_t k = 0; k < seg.rows; ++k) {
+                    Tag& d = expert[r][static_cast<std::size_t>(seg.dst_row + k)];
+                    require(d.src == -1, where + ": unpack overlap");
+                    d = recv[r][static_cast<std::size_t>(seg.src_row + k)];
+                }
+            }
+            for (const auto& seg : st.experts) {
+                const int global = shapes[r].first_local_expert() + seg.expert;
+                require(groups.expert_group[global] == st.group, where + ": expert in the wrong step");
+                for (std::int64_t k = 0; k < seg.rows; ++k) {
+                    Tag& t = expert[r][static_cast<std::size_t>(seg.begin + k)];
+                    require(t.expert == global, where + ": row reached the wrong expert");
+                    if (k > 0) {
+                        const Tag& prev = expert[r][static_cast<std::size_t>(seg.begin + k - 1)];
+                        require(prev.src < t.src || (prev.src == t.src && prev.index + 1 == t.index),
+                                where + ": expert rows not in (source, index) order");
+                    }
+                    ++t.visits;
+                }
+            }
+            for (const auto& seg : st.repack) {
+                for (std::int64_t k = 0; k < seg.rows; ++k) {
+                    Tag& d = back[r][static_cast<std::size_t>(seg.dst_row + k)];
+                    require(d.src == -1, where + ": repack overlap");
+                    d = expert[r][static_cast<std::size_t>(seg.src_row + k)];
+                }
+            }
+        }
+        // Combine: d -> r, back into r's send-buffer order.
+        for (int d = 0; d < W; ++d) {
+            for (int r = 0; r < W; ++r) {
+                const auto& out = plans[d].steps[i].combine;
+                const auto& in = plans[r].steps[i].combine;
+                require(out.send_bytes[r] == in.recv_bytes[d], where + ": combine size mismatch");
+                copy_rows(back[d], out.send_offsets[r], ret[r], in.recv_offsets[d], out.send_bytes[r], rb,
+                          where + " combine");
+            }
+        }
+    }
+    for (int r = 0; r < W; ++r) {
+        for (std::size_t k = 0; k < send[r].size(); ++k) {
+            require(ret[r][k] == send[r][k], where + ": row did not return to its send position");
+            require(ret[r][k].visits == 1, where + ": row processed " + std::to_string(ret[r][k].visits) + " times");
+        }
+    }
+}
+
+template <typename Fn>
+bool expect_invalid(const char* name, Fn fn) {
+    try {
+        fn();
+    } catch (const std::invalid_argument&) {
+        std::printf("PASS negative %s\n", name);
+        return true;
+    }
+    std::printf("FAIL negative %s: accepted\n", name);
+    return false;
+}
+
+}  // namespace
+
+int main() {
+    std::mt19937_64 rng(12345);
+    constexpr int kTrials = 3000;
+    int failed = 0;
+    for (int t = 0; t < kTrials; ++t) {
+        try {
+            run_trial(rng, t);
+        } catch (const std::exception& error) {
+            if (failed++ < 5) std::printf("FAIL %s\n", error.what());
+        }
+    }
+    std::printf("trials: %d passed, %d failed\n", kTrials - failed, failed);
+    bool ok = failed == 0;
+    ok &= expect_invalid("group_out_of_range", [] {
+        nano_nccl::planner::validate_group_plan({{0, 2}, {0, 1}}, 2);
+    });
+    ok &= expect_invalid("order_not_permutation", [] {
+        nano_nccl::planner::validate_group_plan({{0, 1}, {1, 1}}, 2);
+    });
+    ok &= expect_invalid("wrong_expert_count", [] {
+        nano_nccl::planner::validate_group_plan({{0}, {0}}, 2);
+    });
+    ok &= expect_invalid("fixed_too_many_groups", [] { nano_nccl::planner::fixed_group_plan(2, 4, 3); });
+    std::printf("ep_plan=%s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}

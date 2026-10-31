@@ -31,15 +31,16 @@ __global__ void count_experts_kernel(const std::int32_t* ids, int entries, int n
     if (threadIdx.x == 0) counts[e] = total;
 }
 
-__global__ void place_entries_kernel(const std::int32_t* ids, int entries, const std::int32_t* counts,
-                                     std::int32_t* positions) {
+__global__ void place_entries_kernel(const std::int32_t* ids, int entries, const std::int32_t* order,
+                                     const std::int32_t* counts, std::int32_t* positions) {
     using Scan = cub::BlockScan<int, kThreads>;
     __shared__ typename Scan::TempStorage scan;
     __shared__ int base;
-    const int e = blockIdx.x;
+    // Block p places the expert at send-order position p.
+    const int e = order[blockIdx.x];
     if (threadIdx.x == 0) {
         int sum = 0;
-        for (int i = 0; i < e; ++i) sum += counts[i];
+        for (int q = 0; q < static_cast<int>(blockIdx.x); ++q) sum += counts[order[q]];
         base = sum;
     }
     __syncthreads();
@@ -87,12 +88,12 @@ __global__ void swiglu_kernel(const bf16* h, std::int64_t rows, int ffn, bf16* a
     }
 }
 
-__global__ void probe_experts_kernel(bf16* rows, const std::int64_t* expert_offsets, int first_expert,
+__global__ void probe_experts_kernel(bf16* rows, const ExpertSegment* segments, int first_expert,
                                      int hidden) {
-    const int j = blockIdx.x;
-    const float scale = probe_scale(first_expert + j);
-    const std::int64_t begin = expert_offsets[j];
-    const std::int64_t end = expert_offsets[j + 1];
+    const ExpertSegment seg = segments[blockIdx.x];
+    const float scale = probe_scale(first_expert + seg.expert);
+    const std::int64_t begin = seg.begin;
+    const std::int64_t end = seg.begin + seg.rows;
     for (std::int64_t r = begin + blockIdx.y; r < end; r += gridDim.y) {
         bf16* row = rows + r * hidden;
         for (int c = threadIdx.x; c < hidden; c += blockDim.x) {
@@ -123,9 +124,11 @@ void launch_count_experts(const std::int32_t* expert_ids, int entries, int num_e
 }
 
 void launch_place_entries(const std::int32_t* expert_ids, int entries, int num_experts,
-                          const std::int32_t* counts, std::int32_t* positions, cudaStream_t stream) {
+                          const std::int32_t* expert_order, const std::int32_t* counts,
+                          std::int32_t* positions, cudaStream_t stream) {
     if (entries == 0) return;
-    place_entries_kernel<<<num_experts, kThreads, 0, stream>>>(expert_ids, entries, counts, positions);
+    place_entries_kernel<<<num_experts, kThreads, 0, stream>>>(expert_ids, entries, expert_order, counts,
+                                                               positions);
     CUDA_CHECK_THROW(cudaGetLastError());
 }
 
@@ -152,11 +155,11 @@ void launch_swiglu(const bf16* h, std::int64_t rows, int ffn, bf16* a, cudaStrea
     CUDA_CHECK_THROW(cudaGetLastError());
 }
 
-void launch_probe_experts(bf16* rows, const std::int64_t* expert_offsets, int local_experts,
-                          int first_expert, int hidden, cudaStream_t stream) {
-    if (local_experts == 0) return;
-    probe_experts_kernel<<<dim3(local_experts, kRowBlocksPerSegment), 128, 0, stream>>>(
-        rows, expert_offsets, first_expert, hidden);
+void launch_probe_experts(bf16* rows, const ExpertSegment* segments, int num_segments, int first_expert,
+                          int hidden, cudaStream_t stream) {
+    if (num_segments == 0) return;
+    probe_experts_kernel<<<dim3(num_segments, kRowBlocksPerSegment), 128, 0, stream>>>(
+        rows, segments, first_expert, hidden);
     CUDA_CHECK_THROW(cudaGetLastError());
 }
 

@@ -46,10 +46,22 @@ set_target_properties(nano_nccl_peer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(nano_nccl_peer PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(nano_nccl_peer PRIVATE -O2 -Wall -Wextra)
 
-# EP data plane (B1): routing, packing, experts and the MoE layer, on top of
-# a PeerExchanger.
+# Expert grouping plans, shared by the runtime and the simulator; pure C++.
+add_library(nano_nccl_planner STATIC planner/group_plan.cc)
+set_target_properties(nano_nccl_planner PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(nano_nccl_planner PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(nano_nccl_planner PRIVATE -O2 -Wall -Wextra)
+
+# EP row layouts per group step; pure C++, testable without a GPU.
+add_library(nano_nccl_ep_plan STATIC ep/ep_plan.cc)
+set_target_properties(nano_nccl_ep_plan PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(nano_nccl_ep_plan PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(nano_nccl_ep_plan PRIVATE -O2 -Wall -Wextra)
+target_link_libraries(nano_nccl_ep_plan PUBLIC nano_nccl_planner nano_nccl_peer)
+
+# EP data plane (B1/B2): routing, packing, experts and the pipelined MoE
+# layer, on top of a PeerExchanger.
 add_library(nano_nccl_ep STATIC
-    ep/ep_plan.cc
     ep/ep_kernels.cu
     ep/expert_ffn.cc
     ep/moe_layer.cc
@@ -60,7 +72,7 @@ target_compile_options(nano_nccl_ep PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
 )
-target_link_libraries(nano_nccl_ep PUBLIC nano_nccl_peer CUDA::cudart CUDA::cublas)
+target_link_libraries(nano_nccl_ep PUBLIC nano_nccl_ep_plan nano_nccl_peer CUDA::cudart CUDA::cublas)
 
 if(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
     target_sources(nano_nccl PRIVATE transport/rdma/rdma_proxy_timeline.cc)

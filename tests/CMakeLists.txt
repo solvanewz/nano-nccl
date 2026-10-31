@@ -36,7 +36,13 @@ add_executable(nano_nccl_peer_exchange_test peer_exchange_test.cc peer_loopback_
 target_link_libraries(nano_nccl_peer_exchange_test PRIVATE nano_nccl_peer)
 target_compile_options(nano_nccl_peer_exchange_test PRIVATE -O2 -Wall -Wextra)
 
+# EP row plans and group plans, simulated on the CPU; needs no GPU.
+add_executable(nano_nccl_ep_plan_test ep_plan_test.cc)
+target_link_libraries(nano_nccl_ep_plan_test PRIVATE nano_nccl_ep_plan)
+target_compile_options(nano_nccl_ep_plan_test PRIVATE -O2 -Wall -Wextra)
+
 if(BUILD_TESTING)
+    add_test(NAME nano_nccl_ep_plan COMMAND nano_nccl_ep_plan_test)
     add_test(NAME nano_nccl_peer_exchange COMMAND nano_nccl_peer_exchange_test)
     set_tests_properties(nano_nccl_peer_exchange PROPERTIES TIMEOUT 600)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
