@@ -87,5 +87,6 @@ if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)
     )
 endif()
 
+add_subdirectory(sim_adapter)
 add_subdirectory(benchmarks)
 add_subdirectory(tests)

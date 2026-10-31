@@ -49,6 +49,8 @@ public:
 
     int rank() const { return rank_; }
     int nranks() const { return nranks_; }
+    int slots_per_link() const { return slots_; }
+    std::size_t slot_bytes() const { return slot_bytes_; }
     std::size_t active_exchanges() const { return exchanges_.size(); }
 
 private:

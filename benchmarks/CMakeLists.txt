@@ -1,3 +1,8 @@
+# A40 cost profile for the EP simulator; one process, no MPI, no peer access.
+add_executable(nano_nccl_ep_profile ep_profile.cu)
+target_link_libraries(nano_nccl_ep_profile PRIVATE nano_nccl_ep nano_nccl_sim nano_nccl)
+target_compile_options(nano_nccl_ep_profile PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+
 if(NANO_NCCL_ENABLE_MPI)
     add_executable(nano_nccl_collective_bench collective_bench.cu)
     target_link_libraries(nano_nccl_collective_bench PRIVATE

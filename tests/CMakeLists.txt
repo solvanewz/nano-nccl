@@ -41,8 +41,14 @@ add_executable(nano_nccl_ep_plan_test ep_plan_test.cc)
 target_link_libraries(nano_nccl_ep_plan_test PRIVATE nano_nccl_ep_plan)
 target_compile_options(nano_nccl_ep_plan_test PRIVATE -O2 -Wall -Wextra)
 
+# Shared execution description and the EP layer simulator; needs no GPU.
+add_executable(nano_nccl_sim_adapter_test sim_adapter_test.cc)
+target_link_libraries(nano_nccl_sim_adapter_test PRIVATE nano_nccl_sim)
+target_compile_options(nano_nccl_sim_adapter_test PRIVATE -O2 -Wall -Wextra)
+
 if(BUILD_TESTING)
     add_test(NAME nano_nccl_ep_plan COMMAND nano_nccl_ep_plan_test)
+    add_test(NAME nano_nccl_sim_adapter COMMAND nano_nccl_sim_adapter_test)
     add_test(NAME nano_nccl_peer_exchange COMMAND nano_nccl_peer_exchange_test)
     set_tests_properties(nano_nccl_peer_exchange PROPERTIES TIMEOUT 600)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -140,7 +146,7 @@ if(NANO_NCCL_ENABLE_MPI)
     # EP MoE layer over ShmWire; the probe matrix is bit-exact, --ffn runs
     # real experts (checked by ep_moe_reference.py).
     add_executable(nano_nccl_ep_moe_test ep_moe_test.cu)
-    target_link_libraries(nano_nccl_ep_moe_test PRIVATE nano_nccl_ep nano_nccl_peer_shm)
+    target_link_libraries(nano_nccl_ep_moe_test PRIVATE nano_nccl_ep nano_nccl_exec nano_nccl_peer_shm)
     if(BUILD_TESTING)
         foreach(np IN ITEMS 2 4)
             add_test(

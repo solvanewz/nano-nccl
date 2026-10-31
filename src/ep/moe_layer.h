@@ -3,6 +3,7 @@
 #include "ep/ep_kernels.h"
 #include "ep/ep_plan.h"
 #include "ep/expert_ffn.h"
+#include "exec/exec_program.h"
 #include "planner/group_plan.h"
 #include "transport/peer/peer_exchanger.h"
 
@@ -27,16 +28,8 @@ struct MoeLayerConfig {
     ExpertMode mode = ExpertMode::kFfn;
 };
 
-// How the steps of a GroupPlan are scheduled. Every rank must use the same
-// options for the same forward() call: they fix the exchange issue order.
-struct PipelineOptions {
-    // false: each step runs dispatch -> experts -> combine to completion before
-    // the next starts (no communication/computation overlap).
-    bool overlap = true;
-    // With overlap: dispatches of steps i+1 .. i+lookahead may be in flight
-    // while step i computes. Issue order: D0 .. D(L), then C0, D(L+1), C1, ...
-    int lookahead = 1;
-};
+// Shared with the simulator (exec/exec_program.h).
+using PipelineOptions = exec::PipelineOptions;
 
 // Host-observed times of one step, in microseconds since forward() started.
 struct StepTimes {
@@ -50,6 +43,16 @@ struct StepTimes {
     double combine_readable = 0;
 };
 
+// Host-observed times of one LayerProgram operation, in microseconds since
+// forward() started; -1 when not reached.
+struct OpTimes {
+    double issue_begin = -1;
+    double issue_end = -1;
+    // When the condition later ops wait for was first observed: kDone for
+    // host/stream ops, kConsumerReadable for exchanges.
+    double complete = -1;
+};
+
 struct ForwardTimes {
     double route = 0;     // count + place + pack kernels, counts copied to the host
     double counts = 0;    // exchange_counts until readable
@@ -57,15 +60,18 @@ struct ForwardTimes {
     double reduce = 0;    // weighted top-k sum
     double total = 0;     // including waiting for every exchange to finish
     std::vector<StepTimes> steps;  // in execution order
+    std::vector<OpTimes> ops;      // per LayerProgram op
 };
 
 // One MoE layer over an arbitrary-peer exchanger: Counts/Offsets -> Pack ->
 // per step (Dispatch -> Expert FFN -> Combine) -> Reduce.
 //
-// The GroupPlan passed to forward() is fixed for that call. With overlap the
-// host drives the exchanger continuously and launches step i's experts on
-// `stream` as soon as its dispatch is readable, so later dispatches and
-// earlier combines run on the copy engines while experts run.
+// forward() builds the invocation's exec::LayerProgram and executes it: the
+// host drives the exchanger continuously and issues each operation when
+// exec::ProgramCursor says its dependencies hold, so with overlap step i's
+// experts start as soon as its dispatch is readable while later dispatches
+// and earlier combines run on the copy engines. The simulator executes the
+// same program with the same rule. The GroupPlan is fixed for the call.
 //
 // Collective: every rank calls forward() with the same epoch, GroupPlan and
 // PipelineOptions, in the same sequence.
@@ -95,23 +101,20 @@ public:
                          const float* topk_weights, bf16* out, const planner::GroupPlan& groups,
                          const PipelineOptions& options, cudaStream_t stream);
 
-    const DispatchPlan& last_plan() const { return plan_; }
+    const DispatchPlan& last_plan() const { return plan_.rows; }
+    const exec::EpPlan& last_ep_plan() const { return plan_; }
+    const exec::LayerProgram& last_program() const { return program_; }
 
 private:
-    void wait(transport::peer::ExchangeId id, transport::peer::CompletionEvent event);
-    // Waits for `stream` while driving the exchanger: peers depend on this
-    // rank's progress (e.g. to see its last chunks arrive).
-    void sync(cudaStream_t stream);
     void upload_step_tables(cudaStream_t stream);
     void launch_step(int step, cudaStream_t stream);
-    transport::peer::ExchangeId issue_dispatch(std::uint64_t epoch, int step);
-    transport::peer::ExchangeId issue_combine(std::uint64_t epoch, int step);
 
     transport::peer::PeerExchanger& ex_;
     MoeLayerConfig config_;
     ExpertFfn* ffn_;
     int device_;
-    DispatchPlan plan_;
+    exec::EpPlan plan_;
+    exec::LayerProgram program_;
 
     bf16* send_ = nullptr;
     bf16* recv_ = nullptr;
@@ -131,8 +134,7 @@ private:
     // Device addresses of each step's tables inside tables_dev_.
     std::vector<const RowSegment*> unpack_dev_, repack_dev_;
     std::vector<const ExpertSegment*> experts_dev_;
-    cudaEvent_t stream_done_ = nullptr;
-    std::vector<cudaEvent_t> step_done_;
+    std::vector<cudaEvent_t> op_done_;  // per program op; used by stream ops
 };
 
 }  // namespace nano_nccl::ep

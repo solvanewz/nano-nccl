@@ -12,13 +12,15 @@
 //       before it is readable shows up as wrong output.
 //   ep_moe_test --ffn [--tokens T --experts E --topk K --hidden H --ffn-dim F
 //                      --iters N --skew X --groups G --lookahead L
-//                      --no-overlap --dump DIR]
+//                      --no-overlap --dump DIR --trace FILE]
 //       real BF16 SwiGLU experts with the B1 fixed group plan; prints stage
 //       times and the step timeline, and checks that the output is
 //       bit-identical to a serial (one group, no overlap) forward. With
 //       --dump, writes inputs, weights and outputs for
 //       tests/ep_moe_reference.py.
 #include "ep/moe_layer.h"
+#include "ep/synthetic_routing.h"
+#include "exec/exec_trace.h"
 #include "transport/peer/peer_exchanger.h"
 #include "transport/peer/shm_wire.h"
 
@@ -52,6 +54,7 @@ using nano_nccl::planner::GroupPlan;
 using nano_nccl::ep::probe_scale;
 using nano_nccl::transport::peer::PeerExchanger;
 using nano_nccl::transport::peer::ShmWire;
+namespace exec = nano_nccl::exec;
 
 int g_rank = 0;
 int g_world = 0;
@@ -94,36 +97,8 @@ std::vector<bf16> random_bf16(std::size_t n, std::uint64_t seed, float scale) {
     return v;
 }
 
-struct Routing {
-    std::vector<std::int32_t> ids;
-    std::vector<float> weights;
-};
-
-// Top-k distinct experts per token, drawn with probability ~ (e + 1)^-skew;
-// with only_rank >= 0, only that rank's experts are drawn.
-Routing make_routing(const EpShape& s, int tokens, double skew, int only_rank, std::uint64_t seed) {
-    std::mt19937_64 rng(seed);
-    const int first = only_rank >= 0 ? only_rank * s.experts_per_rank() : 0;
-    const int count = only_rank >= 0 ? s.experts_per_rank() : s.num_experts;
-    std::vector<double> base(count);
-    for (int e = 0; e < count; ++e) base[e] = std::pow(e + 1.0, -skew);
-    Routing r;
-    for (int t = 0; t < tokens; ++t) {
-        std::vector<double> p = base;
-        float sum = 0;
-        std::vector<float> w(s.top_k);
-        for (int k = 0; k < s.top_k; ++k) {
-            std::discrete_distribution<int> pick(p.begin(), p.end());
-            const int e = pick(rng);
-            p[e] = 0;
-            r.ids.push_back(first + e);
-            w[k] = 0.1f + static_cast<float>(rng() % 1000) / 1000.0f;
-            sum += w[k];
-        }
-        for (float x : w) r.weights.push_back(x / sum);
-    }
-    return r;
-}
+using nano_nccl::ep::make_routing;
+using nano_nccl::ep::Routing;
 
 std::unique_ptr<PeerExchanger> g_exchanger;
 
@@ -288,7 +263,59 @@ struct FfnArgs {
     int lookahead = 1;
     bool overlap = true;
     std::string dump;
+    std::string trace;  // exec::LayerTrace of the timed runs, written by rank 0
+    int slots = 0;
+    std::size_t slot_bytes = 0;
 };
+
+// Gathers every rank's counts, stage means and last-iteration op times.
+void write_trace(const FfnArgs& a, const EpShape& s, const MoeLayer& layer, const ForwardTimes& last,
+                 const double* sum, const GroupPlan& plan, const PipelineOptions& options) {
+    const exec::LayerProgram& prog = layer.last_program();
+    const std::size_t n = prog.ops.size();
+    std::vector<double> mine{static_cast<double>(a.tokens)};
+    for (int i = 0; i < 5; ++i) mine.push_back(sum[i] / a.iters);
+    for (const auto& t : last.ops) mine.insert(mine.end(), {t.issue_begin, t.issue_end, t.complete});
+    const std::vector<std::int64_t>& counts = layer.last_plan().send_counts;
+    std::vector<double> all(mine.size() * g_world);
+    std::vector<std::int64_t> all_counts(counts.size() * g_world);
+    MPI_Gather(mine.data(), static_cast<int>(mine.size()), MPI_DOUBLE, all.data(), static_cast<int>(mine.size()),
+               MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gather(counts.data(), static_cast<int>(counts.size()), MPI_INT64_T, all_counts.data(),
+               static_cast<int>(counts.size()), MPI_INT64_T, 0, MPI_COMM_WORLD);
+    if (g_rank != 0) return;
+    exec::LayerTrace t;
+    t.key = exec::ProfileKey{g_world, s.num_experts, s.top_k, s.hidden, s.ffn, a.tokens, "zipf", a.skew,
+                             "bf16", "ffn", "shm", a.slots, a.slot_bytes};
+    t.groups = plan;
+    t.options = options;
+    t.iters = a.iters;
+    for (int r = 0; r < g_world; ++r) {
+        const double* m = all.data() + r * mine.size();
+        exec::TraceRank tr;
+        tr.tokens = static_cast<int>(m[0]);
+        tr.route = m[1];
+        tr.counts = m[2];
+        tr.pipeline = m[3];
+        tr.reduce = m[4];
+        tr.total = m[5];
+        tr.expert_counts.assign(all_counts.begin() + r * counts.size(), all_counts.begin() + (r + 1) * counts.size());
+        t.ranks.push_back(tr);
+        for (std::size_t i = 0; i < n; ++i) {
+            exec::TraceOp op;
+            op.rank = r;
+            op.op = static_cast<int>(i);
+            op.kind = prog.ops[i].kind;
+            op.step = prog.ops[i].step;
+            op.issue_begin = m[6 + 3 * i];
+            op.issue_end = m[7 + 3 * i];
+            op.complete = m[8 + 3 * i];
+            t.ops.push_back(op);
+        }
+    }
+    t.save(a.trace);
+    std::printf("trace written to %s\n", a.trace.c_str());
+}
 
 int run_ffn(const FfnArgs& a) {
     EpShape s{g_world, g_rank, a.experts, a.top_k, a.hidden, a.ffn};
@@ -308,7 +335,7 @@ int run_ffn(const FfnArgs& a) {
     MoeLayer layer(*g_exchanger, cfg, &ffn, g_device);
 
     const auto x = random_bf16(static_cast<std::size_t>(a.tokens) * a.hidden, 77 + g_rank, 1.0f);
-    const Routing routing = make_routing(s, a.tokens, a.skew, -1, 4242 + g_rank);
+    const Routing routing = make_routing(s, a.tokens, a.skew, -1, nano_nccl::ep::benchmark_routing_seed(g_rank));
     DeviceArray<bf16> dx(x.size()), dout(x.size());
     DeviceArray<std::int32_t> dids(routing.ids.size());
     DeviceArray<float> dw(routing.weights.size());
@@ -334,6 +361,7 @@ int run_ffn(const FfnArgs& a) {
         for (int i = 0; i < kStages; ++i) sum[i] += v[i];
         last = t;
     }
+    if (!a.trace.empty()) write_trace(a, s, layer, last, sum, plan, options);
     double slowest[kStages];
     MPI_Reduce(sum, slowest, kStages, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     std::int64_t recv_rows = layer.last_plan().recv_rows, max_recv = 0, min_recv = 0;
@@ -443,8 +471,11 @@ int main(int argc, char** argv) {
             else if (arg == "--groups") a.groups = std::atoi(next());
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());
             else if (arg == "--no-overlap") a.overlap = false;
+            else if (arg == "--trace") a.trace = next();
             else throw std::invalid_argument("unknown argument " + arg);
         }
+        a.slots = slots;
+        a.slot_bytes = slot_bytes;
         ShmWire wire(MPI_COMM_WORLD, {slots, slot_bytes, g_device, copy_delay_us});
         g_exchanger = std::make_unique<PeerExchanger>(&wire);
         status = ffn_mode ? run_ffn(a) : run_probe();
