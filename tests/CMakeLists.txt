@@ -31,7 +31,14 @@ if(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
     endif()
 endif()
 
+# EP peer exchange protocol on the CPU multi-rank loopback fabric; needs no GPU.
+add_executable(nano_nccl_peer_exchange_test peer_exchange_test.cc peer_loopback_fabric.cc)
+target_link_libraries(nano_nccl_peer_exchange_test PRIVATE nano_nccl_peer)
+target_compile_options(nano_nccl_peer_exchange_test PRIVATE -O2 -Wall -Wextra)
+
 if(BUILD_TESTING)
+    add_test(NAME nano_nccl_peer_exchange COMMAND nano_nccl_peer_exchange_test)
+    set_tests_properties(nano_nccl_peer_exchange PROPERTIES TIMEOUT 600)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
     add_test(NAME nano_nccl_simple_protocol COMMAND nano_nccl_simple_protocol)
     set_tests_properties(nano_nccl_simple_protocol PROPERTIES SKIP_RETURN_CODE 77)

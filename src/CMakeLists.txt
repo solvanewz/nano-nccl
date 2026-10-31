@@ -36,6 +36,16 @@ endfunction()
 
 add_nano_nccl_library(nano_nccl)
 
+# EP arbitrary-peer exchange (B1). Host-only protocol core, separate from the
+# Ring path and from the compile-time rank count.
+add_library(nano_nccl_peer STATIC
+    transport/peer/peer_types.cc
+    transport/peer/peer_exchanger.cc
+)
+set_target_properties(nano_nccl_peer PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(nano_nccl_peer PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(nano_nccl_peer PRIVATE -O2 -Wall -Wextra)
+
 if(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
     target_sources(nano_nccl PRIVATE transport/rdma/rdma_proxy_timeline.cc)
     target_compile_definitions(nano_nccl PUBLIC
