@@ -1,6 +1,7 @@
 #include "transport/peer/shm_wire.h"
 
 #include "core/buffer.h"
+#include "core/numa.h"
 
 #include <array>
 #include <atomic>
@@ -73,6 +74,8 @@ void agree(MPI_Comm comm, const std::string& local_error, const char* stage) {
     throw std::runtime_error(std::string("ShmWire ") + stage + " failed");
 }
 
+void CUDART_CB sleep_on_stream(void* micros) { usleep(static_cast<useconds_t>(*static_cast<int*>(micros))); }
+
 bool event_done(cudaEvent_t event) {
     const cudaError_t status = cudaEventQuery(event);
     if (status == cudaSuccess) return true;
@@ -101,7 +104,10 @@ struct ShmWire::Region {
 };
 
 ShmWire::ShmWire(MPI_Comm comm, const ShmWireConfig& config)
-    : slots_(config.slots_per_link), slot_bytes_(config.slot_bytes), device_(config.device) {
+    : slots_(config.slots_per_link),
+      slot_bytes_(config.slot_bytes),
+      device_(config.device),
+      debug_delay_us_(config.debug_copy_delay_us) {
     mpi_check(MPI_Comm_rank(comm, &rank_), "MPI_Comm_rank");
     mpi_check(MPI_Comm_size(comm, &nranks_), "MPI_Comm_size");
     const auto n = static_cast<std::size_t>(nranks_);
@@ -168,7 +174,12 @@ ShmWire::ShmWire(MPI_Comm comm, const ShmWireConfig& config)
             region->base = nullptr;
             throw std::system_error(errno, std::generic_category(), "mmap(own region)");
         }
+        // First touch on the receiving GPU's NUMA node: its copy-outs read
+        // the slots locally, and the senders' writes cross sockets as posted
+        // writes, which tolerate the distance better than reads.
+        core::numa_set_prefer(core::gpu_numa_node(device_));
         std::memset(region->base, 0, region_bytes_);
+        core::numa_set_prefer(-1);
         std::snprintf(my_name.data(), my_name.size(), "%s", region->name.c_str());
         regions_[static_cast<std::size_t>(rank_)] = std::move(region);
     } catch (const std::exception& e) {
@@ -274,6 +285,10 @@ void ShmWire::check_link(int peer, const char* what) const {
     }
 }
 
+void ShmWire::debug_delay(cudaStream_t stream) {
+    if (debug_delay_us_ > 0) CUDA_CHECK_THROW(cudaLaunchHostFunc(stream, sleep_on_stream, &debug_delay_us_));
+}
+
 cudaEvent_t ShmWire::take_event() {
     if (!free_events_.empty()) {
         cudaEvent_t event = free_events_.back();
@@ -331,6 +346,7 @@ PeerWire::OpId ShmWire::write_chunk(int dst, std::uint64_t seq, const ChunkHeade
     // and that counter is published after the payload copy finishes.
     std::memcpy(header_slot(dst, rank_, seq), &header, sizeof(ChunkHeader));
     CUDA_CHECK_THROW(cudaSetDevice(device_));
+    debug_delay(tx_stream_);
     if (header.bytes != 0) {
         CUDA_CHECK_THROW(cudaMemcpyAsync(payload_slot(dst, rank_, seq), src, header.bytes,
                                          cudaMemcpyDefault, tx_stream_));
@@ -393,6 +409,7 @@ PeerWire::OpId ShmWire::copy_out(int src, std::uint64_t seq, std::byte* dst, std
         throw std::invalid_argument("ShmWire::copy_out: bad destination");
     }
     CUDA_CHECK_THROW(cudaSetDevice(device_));
+    debug_delay(rx_stream_);
     CUDA_CHECK_THROW(cudaMemcpyAsync(dst, payload_slot(rank_, src, seq), bytes, cudaMemcpyDefault,
                                      rx_stream_));
     return record(false, rx_stream_);

@@ -67,6 +67,7 @@ struct CaseConfig {
     int inflight;
     Memory memory;
     std::uint64_t seed;
+    int delay_us;  // ShmWireConfig::debug_copy_delay_us
 };
 
 std::string name_of(const CaseConfig& c) {
@@ -74,7 +75,7 @@ std::string name_of(const CaseConfig& c) {
            " slot_bytes=" + std::to_string(c.slot_bytes) + " rounds=" + std::to_string(c.rounds) +
            " inflight=" + std::to_string(c.inflight) +
            " memory=" + (c.memory == Memory::kDevice ? "device" : "pinned") +
-           " seed=" + std::to_string(c.seed);
+           " seed=" + std::to_string(c.seed) + " delay_us=" + std::to_string(c.delay_us);
 }
 
 std::byte pattern(std::uint64_t epoch, int src, int dst, std::size_t index) {
@@ -193,7 +194,7 @@ bool finished(const PeerExchanger& e, ExchangeId id) {
 }
 
 std::uint64_t run_case(const CaseConfig& c) {
-    ShmWire wire(MPI_COMM_WORLD, {c.slots, c.slot_bytes, g_device});
+    ShmWire wire(MPI_COMM_WORLD, {c.slots, c.slot_bytes, g_device, c.delay_us});
     PeerExchanger e(&wire);
     const auto sizes = make_sizes(c);
     const int r = g_rank;
@@ -379,29 +380,42 @@ bool negative_tests() {
 int run_tests() {
     int failed = 0, passed = 0;
     std::uint64_t bytes = 0;
+    std::vector<CaseConfig> cases;
+    // Slow copies: any completion reported before its copy finished is seen.
+    // They run first, so a mutation check shows whether they catch a bug.
+    for (int slots : {1, 2}) {
+        for (int inflight : {1, 2}) {
+            for (Memory memory : {Memory::kDevice, Memory::kPinnedHost}) {
+                cases.push_back({slots, 4096, 6, inflight, memory, static_cast<std::uint64_t>(77 + slots * 10 + inflight),
+                                 200});
+            }
+        }
+    }
     for (int slots : {1, 2, 4}) {
         for (std::size_t slot_bytes : {std::size_t{4096}, std::size_t{256} << 10}) {
             for (int inflight : {1, 2}) {
                 for (Memory memory : {Memory::kDevice, Memory::kPinnedHost}) {
-                    const CaseConfig c{slots, slot_bytes, 8, inflight, memory,
-                                       static_cast<std::uint64_t>(slots * 100 + inflight * 10) + slot_bytes};
-                    const auto start = Clock::now();
-                    try {
-                        bytes += run_case(c);
-                        ++passed;
-                    } catch (const std::exception& error) {
-                        // Ranks cannot recover a half-finished exchange together.
-                        std::printf("FAIL rank %d %s\n  %s\n", g_rank, name_of(c).c_str(), error.what());
-                        std::fflush(stdout);
-                        MPI_Abort(MPI_COMM_WORLD, 1);
-                    }
-                    if (g_rank == 0) {
-                        std::printf("PASS %s (%.2f s)\n", name_of(c).c_str(),
-                                    std::chrono::duration<double>(Clock::now() - start).count());
-                        std::fflush(stdout);
-                    }
+                    cases.push_back({slots, slot_bytes, 8, inflight, memory,
+                                     static_cast<std::uint64_t>(slots * 100 + inflight * 10) + slot_bytes, 0});
                 }
             }
+        }
+    }
+    for (const CaseConfig& c : cases) {
+        const auto start = Clock::now();
+        try {
+            bytes += run_case(c);
+            ++passed;
+        } catch (const std::exception& error) {
+            // Ranks cannot recover a half-finished exchange together.
+            std::printf("FAIL rank %d %s\n  %s\n", g_rank, name_of(c).c_str(), error.what());
+            std::fflush(stdout);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        if (g_rank == 0) {
+            std::printf("PASS %s (%.2f s)\n", name_of(c).c_str(),
+                        std::chrono::duration<double>(Clock::now() - start).count());
+            std::fflush(stdout);
         }
     }
     std::uint64_t all_bytes = 0;

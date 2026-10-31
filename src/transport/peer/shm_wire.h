@@ -19,6 +19,10 @@ struct ShmWireConfig {
     int slots_per_link = 4;
     std::size_t slot_bytes = std::size_t{1} << 20;
     int device = 0;  // CUDA device this rank's copies run on
+    // Tests only: every copy first waits this long on its stream, so a
+    // completion reported before its copy finished shows up as stale data
+    // instead of depending on timing luck.
+    int debug_copy_delay_us = 0;
 };
 
 // PeerWire between processes on one host, staged through POSIX shared
@@ -41,6 +45,12 @@ struct ShmWireConfig {
 // A copy-out op is done when the copy into the destination has finished
 // (cudaEventQuery on the receive copy stream), so the data is visible to any
 // later work on the device.
+//
+// Arrivals are published only from progress(): a rank that stops driving
+// its exchanger (for example while blocked on a stream) delays its peers by
+// that long, so callers poll instead of blocking.
+//
+// Each receive region is first touched on the NUMA node of its owner's GPU.
 //
 // Collective: every rank of `comm` constructs it with the same
 // slots_per_link and slot_bytes. All ranks must share one host.
@@ -90,6 +100,7 @@ private:
     void recycle_event(cudaEvent_t event);
     OpId record(bool is_write, cudaStream_t stream);
     void check_link(int peer, const char* what) const;
+    void debug_delay(cudaStream_t stream);
 
     int rank_ = 0;
     int nranks_ = 0;
@@ -100,6 +111,7 @@ private:
     std::size_t link_bytes_ = 0;
     std::size_t region_bytes_ = 0;
     int device_ = 0;
+    int debug_delay_us_ = 0;
 
     std::vector<std::unique_ptr<Region>> regions_;  // indexed by owning rank
     std::byte* self_payload_ = nullptr;  // device memory, slots of the self link
