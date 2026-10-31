@@ -46,6 +46,22 @@ set_target_properties(nano_nccl_peer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(nano_nccl_peer PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(nano_nccl_peer PRIVATE -O2 -Wall -Wextra)
 
+# EP data plane (B1): routing, packing, experts and the MoE layer, on top of
+# a PeerExchanger.
+add_library(nano_nccl_ep STATIC
+    ep/ep_plan.cc
+    ep/ep_kernels.cu
+    ep/expert_ffn.cc
+    ep/moe_layer.cc
+)
+set_target_properties(nano_nccl_ep PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(nano_nccl_ep PUBLIC ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(nano_nccl_ep PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-O2 -Wall -Wextra>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+)
+target_link_libraries(nano_nccl_ep PUBLIC nano_nccl_peer CUDA::cudart CUDA::cublas)
+
 if(NANO_NCCL_ENABLE_RDMA_PROXY_TIMELINE)
     target_sources(nano_nccl PRIVATE transport/rdma/rdma_proxy_timeline.cc)
     target_compile_definitions(nano_nccl PUBLIC
@@ -104,7 +120,7 @@ if(NANO_NCCL_ENABLE_MPI)
     )
     target_compile_options(nano_nccl_peer_shm PRIVATE -O2 -Wall -Wextra)
     target_compile_definitions(nano_nccl_peer_shm PUBLIC OMPI_SKIP_MPICXX)
-    target_link_libraries(nano_nccl_peer_shm PUBLIC nano_nccl_peer CUDA::cudart MPI::MPI_C)
+    target_link_libraries(nano_nccl_peer_shm PUBLIC nano_nccl_peer nano_nccl CUDA::cudart MPI::MPI_C)
 
     add_library(nano_nccl_mpi_c SHARED
         collective/all_reduce/mpi_c_api.cc

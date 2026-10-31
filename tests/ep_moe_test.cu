@@ -1,0 +1,379 @@
+// EP MoE layer over ShmWire (B1), one process per rank under mpirun.
+//
+//   ep_moe_test [--slots S] [--slot-bytes B]
+//       probe matrix: experts scale rows by powers of two, so every output
+//       is checked bit-exactly against a host reference. Covers skewed
+//       routing, ranks with no tokens, all tokens routed to one rank's
+//       experts, unequal token counts, and several forwards per layer.
+//   ep_moe_test --ffn [--tokens T --experts E --topk K --hidden H --ffn-dim F
+//                      --iters N --skew X --dump DIR]
+//       real BF16 SwiGLU experts; prints per-stage times. With --dump, writes
+//       inputs, weights and outputs for tests/ep_moe_reference.py.
+#include "ep/moe_layer.h"
+#include "transport/peer/peer_exchanger.h"
+#include "transport/peer/shm_wire.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <mpi.h>
+
+namespace {
+
+using nano_nccl::ep::bf16;
+using nano_nccl::ep::EpShape;
+using nano_nccl::ep::ExpertFfn;
+using nano_nccl::ep::ExpertMode;
+using nano_nccl::ep::MoeLayer;
+using nano_nccl::ep::MoeLayerConfig;
+using nano_nccl::ep::StageTimes;
+using nano_nccl::ep::probe_scale;
+using nano_nccl::transport::peer::PeerExchanger;
+using nano_nccl::transport::peer::ShmWire;
+
+int g_rank = 0;
+int g_world = 0;
+int g_device = 0;
+
+void cuda_check(cudaError_t status, const char* what) {
+    if (status != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
+}
+
+template <typename T>
+struct DeviceArray {
+    T* ptr = nullptr;
+    explicit DeviceArray(std::size_t n) { cuda_check(cudaMalloc(&ptr, std::max<std::size_t>(n, 1) * sizeof(T)), "cudaMalloc"); }
+    ~DeviceArray() { cudaFree(ptr); }
+    DeviceArray(const DeviceArray&) = delete;
+    DeviceArray& operator=(const DeviceArray&) = delete;
+    void upload(const std::vector<T>& v) {
+        cuda_check(cudaMemcpy(ptr, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice), "upload");
+    }
+    std::vector<T> download(std::size_t n) const {
+        std::vector<T> v(n);
+        cuda_check(cudaMemcpy(v.data(), ptr, n * sizeof(T), cudaMemcpyDeviceToHost), "download");
+        return v;
+    }
+};
+
+float uniform(std::uint64_t seed, std::uint64_t i) {  // [-1, 1)
+    std::uint64_t x = seed * 0x9E3779B97F4A7C15ull + i * 0xD1B54A32D192ED03ull;
+    x ^= x >> 33;
+    x *= 0xFF51AFD7ED558CCDull;
+    x ^= x >> 33;
+    x *= 0xC4CEB9FE1A85EC53ull;
+    x ^= x >> 33;
+    return static_cast<float>(x >> 40) / static_cast<float>(1ull << 23) - 1.0f;
+}
+
+std::vector<bf16> random_bf16(std::size_t n, std::uint64_t seed, float scale) {
+    std::vector<bf16> v(n);
+    for (std::size_t i = 0; i < n; ++i) v[i] = __float2bfloat16_rn(uniform(seed, i) * scale);
+    return v;
+}
+
+struct Routing {
+    std::vector<std::int32_t> ids;
+    std::vector<float> weights;
+};
+
+// Top-k distinct experts per token, drawn with probability ~ (e + 1)^-skew;
+// with only_rank >= 0, only that rank's experts are drawn.
+Routing make_routing(const EpShape& s, int tokens, double skew, int only_rank, std::uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    const int first = only_rank >= 0 ? only_rank * s.experts_per_rank() : 0;
+    const int count = only_rank >= 0 ? s.experts_per_rank() : s.num_experts;
+    std::vector<double> base(count);
+    for (int e = 0; e < count; ++e) base[e] = std::pow(e + 1.0, -skew);
+    Routing r;
+    for (int t = 0; t < tokens; ++t) {
+        std::vector<double> p = base;
+        float sum = 0;
+        std::vector<float> w(s.top_k);
+        for (int k = 0; k < s.top_k; ++k) {
+            std::discrete_distribution<int> pick(p.begin(), p.end());
+            const int e = pick(rng);
+            p[e] = 0;
+            r.ids.push_back(first + e);
+            w[k] = 0.1f + static_cast<float>(rng() % 1000) / 1000.0f;
+            sum += w[k];
+        }
+        for (float x : w) r.weights.push_back(x / sum);
+    }
+    return r;
+}
+
+std::unique_ptr<PeerExchanger> g_exchanger;
+
+struct ProbeCase {
+    const char* name;
+    int experts_per_rank;
+    int top_k;
+    int hidden;
+    double skew;
+    int only_rank;     // -1: any expert
+    int base_tokens;   // rank r gets base + r * step tokens, except zero_rank
+    int step_tokens;
+    int zero_rank;     // -1: none
+};
+
+int tokens_of(const ProbeCase& c, int rank) {
+    if (rank == c.zero_rank) return 0;
+    return c.base_tokens + rank * c.step_tokens;
+}
+
+// Returns the number of output values checked on this rank.
+std::uint64_t run_probe_case(const ProbeCase& c, std::uint64_t* epoch) {
+    EpShape s{g_world, g_rank, c.experts_per_rank * g_world, c.top_k, c.hidden, 0};
+    int max_tokens = 0;
+    for (int r = 0; r < g_world; ++r) max_tokens = std::max(max_tokens, tokens_of(c, r));
+    MoeLayerConfig cfg{s, max_tokens, 0, ExpertMode::kProbe};
+    MoeLayer layer(*g_exchanger, cfg, nullptr, g_device);
+    cudaStream_t stream;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+    std::uint64_t checked = 0;
+    for (int iter = 0; iter < 3; ++iter) {
+        // Different token counts per iteration so stale rows would show up.
+        const int tokens = std::max(0, tokens_of(c, g_rank) - (g_rank == c.zero_rank ? 0 : iter * 7));
+        const std::uint64_t seed = 1000003ull * (iter + 1) + 7919ull * g_rank + c.hidden;
+        const auto x = random_bf16(static_cast<std::size_t>(tokens) * c.hidden, seed, 1.0f);
+        const Routing routing = make_routing(s, tokens, c.skew, c.only_rank, seed ^ 0xABCDEFull);
+        DeviceArray<bf16> dx(x.size()), dout(x.size());
+        DeviceArray<std::int32_t> dids(routing.ids.size());
+        DeviceArray<float> dw(routing.weights.size());
+        dx.upload(x);
+        dids.upload(routing.ids);
+        dw.upload(routing.weights);
+        cuda_check(cudaMemset(dout.ptr, 0xFF, std::max<std::size_t>(x.size(), 1) * sizeof(bf16)), "memset");
+        layer.forward((*epoch)++, dx.ptr, tokens, dids.ptr, dw.ptr, dout.ptr, stream);
+        const auto out = dout.download(x.size());
+        for (int t = 0; t < tokens; ++t) {
+            for (int h = 0; h < c.hidden; ++h) {
+                float acc = 0.0f;
+                for (int k = 0; k < c.top_k; ++k) {
+                    const int e = routing.ids[t * c.top_k + k];
+                    const float v = __bfloat162float(
+                        __float2bfloat16_rn(__bfloat162float(x[t * c.hidden + h]) * probe_scale(e)));
+                    acc = std::fma(routing.weights[t * c.top_k + k], v, acc);
+                }
+                const bf16 want = __float2bfloat16_rn(acc);
+                const bf16 got = out[t * c.hidden + h];
+                if (std::memcmp(&want, &got, sizeof(bf16)) != 0) {
+                    throw std::runtime_error(std::string(c.name) + " iter " + std::to_string(iter) + ": token " +
+                                             std::to_string(t) + " col " + std::to_string(h) + " got " +
+                                             std::to_string(__bfloat162float(got)) + " want " +
+                                             std::to_string(__bfloat162float(want)));
+                }
+            }
+        }
+        checked += static_cast<std::uint64_t>(tokens) * c.hidden;
+    }
+    cudaStreamDestroy(stream);
+    return checked;
+}
+
+int run_probe() {
+    const ProbeCase cases[] = {
+        {"uniform", 2, 2, 64, 0.0, -1, 257, 0, -1},
+        {"skewed_k4", 4, 4, 128, 1.5, -1, 1000, 0, -1},
+        {"top1_zero_rank", 1, 1, 256, 0.0, -1, 300, 0, 1},
+        {"all_to_rank0", 2, 2, 64, 0.0, 0, 500, 0, -1},
+        {"unequal_tokens_k8", 8, 8, 32, 0.8, -1, 100, 37, -1},
+        {"single_token", 2, 2, 1024, 0.0, -1, 1, 0, -1},
+        {"wide_rows", 2, 2, 4096, 0.5, -1, 200, 50, -1},
+    };
+    std::uint64_t epoch = 1, checked = 0;
+    for (const ProbeCase& c : cases) {
+        try {
+            checked += run_probe_case(c, &epoch);
+        } catch (const std::exception& error) {
+            std::printf("FAIL rank %d probe %s: %s\n", g_rank, c.name, error.what());
+            std::fflush(stdout);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+        if (g_rank == 0) {
+            std::printf("PASS probe %s\n", c.name);
+            std::fflush(stdout);
+        }
+    }
+    std::uint64_t all = 0;
+    MPI_Reduce(&checked, &all, 1, MPI_UINT64_T, MPI_SUM, 0, MPI_COMM_WORLD);
+    if (g_rank == 0) {
+        std::printf("probe: %zu cases, %llu output values bit-exact\n", sizeof(cases) / sizeof(cases[0]),
+                    static_cast<unsigned long long>(all));
+        std::printf("ep_moe_probe=PASS\n");
+    }
+    return 0;
+}
+
+void write_file(const std::string& path, const void* data, std::size_t bytes) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) throw std::runtime_error("cannot open " + path);
+    const bool ok = std::fwrite(data, 1, bytes, f) == bytes;
+    std::fclose(f);
+    if (!ok) throw std::runtime_error("short write to " + path);
+}
+
+struct FfnArgs {
+    int tokens = 2048;
+    int experts = 8;
+    int top_k = 2;
+    int hidden = 1024;
+    int ffn = 2048;
+    int iters = 10;
+    double skew = 0.0;
+    std::string dump;
+};
+
+int run_ffn(const FfnArgs& a) {
+    EpShape s{g_world, g_rank, a.experts, a.top_k, a.hidden, a.ffn};
+    nano_nccl::ep::validate_shape(s);
+    const int epr = s.experts_per_rank();
+    MoeLayerConfig cfg{s, a.tokens, 0, ExpertMode::kFfn};
+    const std::int64_t max_rows = static_cast<std::int64_t>(a.tokens) * a.top_k * g_world;
+    ExpertFfn ffn(g_device, epr, a.hidden, a.ffn, max_rows);
+    std::vector<std::vector<bf16>> w13(epr), w2(epr);
+    for (int j = 0; j < epr; ++j) {
+        const int e = s.first_local_expert() + j;
+        w13[j] = random_bf16(static_cast<std::size_t>(a.hidden) * 2 * a.ffn, 1000 + e, 1.0f / std::sqrt(a.hidden));
+        w2[j] = random_bf16(static_cast<std::size_t>(a.ffn) * a.hidden, 5000 + e, 1.0f / std::sqrt(a.ffn));
+        cuda_check(cudaMemcpy(ffn.w13(j), w13[j].data(), w13[j].size() * sizeof(bf16), cudaMemcpyHostToDevice), "w13");
+        cuda_check(cudaMemcpy(ffn.w2(j), w2[j].data(), w2[j].size() * sizeof(bf16), cudaMemcpyHostToDevice), "w2");
+    }
+    MoeLayer layer(*g_exchanger, cfg, &ffn, g_device);
+
+    const auto x = random_bf16(static_cast<std::size_t>(a.tokens) * a.hidden, 77 + g_rank, 1.0f);
+    const Routing routing = make_routing(s, a.tokens, a.skew, -1, 4242 + g_rank);
+    DeviceArray<bf16> dx(x.size()), dout(x.size());
+    DeviceArray<std::int32_t> dids(routing.ids.size());
+    DeviceArray<float> dw(routing.weights.size());
+    dx.upload(x);
+    dids.upload(routing.ids);
+    dw.upload(routing.weights);
+    cudaStream_t stream;
+    cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
+
+    StageTimes sum;
+    const int warmup = 2;
+    for (int it = 0; it < warmup + a.iters; ++it) {
+        MPI_Barrier(MPI_COMM_WORLD);
+        const StageTimes t = layer.forward(static_cast<std::uint64_t>(it + 1), dx.ptr, a.tokens, dids.ptr, dw.ptr,
+                                           dout.ptr, stream);
+        if (it < warmup) continue;
+        sum.route += t.route;
+        sum.counts += t.counts;
+        sum.dispatch += t.dispatch;
+        sum.expert += t.expert;
+        sum.combine += t.combine;
+        sum.reduce += t.reduce;
+        sum.total += t.total;
+    }
+    double local[7] = {sum.route, sum.counts, sum.dispatch, sum.expert, sum.combine, sum.reduce, sum.total};
+    double slowest[7];
+    MPI_Reduce(local, slowest, 7, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    std::int64_t recv_rows = layer.last_plan().recv_rows, max_recv = 0, min_recv = 0;
+    MPI_Reduce(&recv_rows, &max_recv, 1, MPI_INT64_T, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&recv_rows, &min_recv, 1, MPI_INT64_T, MPI_MIN, 0, MPI_COMM_WORLD);
+    if (g_rank == 0) {
+        std::printf("# EP MoE serial: ranks=%d tokens/rank=%d experts=%d top_k=%d hidden=%d ffn=%d skew=%.2f\n",
+                    g_world, a.tokens, a.experts, a.top_k, a.hidden, a.ffn, a.skew);
+        std::printf("# expert rows per rank: min %lld max %lld\n", static_cast<long long>(min_recv),
+                    static_cast<long long>(max_recv));
+        const char* names[7] = {"route", "counts", "dispatch", "expert", "combine", "reduce", "total"};
+        std::printf("# stage times, us (mean over %d iters, slowest rank per stage)\n", a.iters);
+        for (int i = 0; i < 7; ++i) std::printf("  %-9s %10.1f\n", names[i], slowest[i] / a.iters);
+    }
+
+    if (!a.dump.empty()) {
+        const std::string p = a.dump + "/";
+        const std::string r = std::to_string(g_rank);
+        const auto out = dout.download(x.size());
+        write_file(p + "x_" + r + ".bin", x.data(), x.size() * sizeof(bf16));
+        write_file(p + "ids_" + r + ".bin", routing.ids.data(), routing.ids.size() * sizeof(std::int32_t));
+        write_file(p + "weights_" + r + ".bin", routing.weights.data(), routing.weights.size() * sizeof(float));
+        write_file(p + "out_" + r + ".bin", out.data(), out.size() * sizeof(bf16));
+        for (int j = 0; j < epr; ++j) {
+            const std::string e = std::to_string(s.first_local_expert() + j);
+            write_file(p + "w13_" + e + ".bin", w13[j].data(), w13[j].size() * sizeof(bf16));
+            write_file(p + "w2_" + e + ".bin", w2[j].data(), w2[j].size() * sizeof(bf16));
+        }
+        if (g_rank == 0) {
+            const std::string meta = "{\"world\": " + std::to_string(g_world) + ", \"tokens\": " +
+                                     std::to_string(a.tokens) + ", \"experts\": " + std::to_string(a.experts) +
+                                     ", \"top_k\": " + std::to_string(a.top_k) + ", \"hidden\": " +
+                                     std::to_string(a.hidden) + ", \"ffn\": " + std::to_string(a.ffn) + "}\n";
+            write_file(p + "meta.json", meta.data(), meta.size());
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+        if (g_rank == 0) std::printf("dumped to %s\n", a.dump.c_str());
+    }
+    cudaStreamDestroy(stream);
+    return 0;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &g_world);
+    int status = 1;
+    try {
+        MPI_Comm node;
+        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, 0, MPI_INFO_NULL, &node);
+        int local_rank = 0;
+        MPI_Comm_rank(node, &local_rank);
+        MPI_Comm_free(&node);
+        int devices = 0;
+        cuda_check(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
+        g_device = local_rank % devices;
+        cuda_check(cudaSetDevice(g_device), "cudaSetDevice");
+
+        bool ffn_mode = false;
+        int slots = 4;
+        std::size_t slot_bytes = std::size_t{1} << 20;
+        FfnArgs a;
+        for (int i = 1; i < argc; ++i) {
+            const std::string arg = argv[i];
+            auto next = [&]() -> const char* {
+                if (i + 1 >= argc) throw std::invalid_argument("missing value for " + arg);
+                return argv[++i];
+            };
+            if (arg == "--ffn") ffn_mode = true;
+            else if (arg == "--slots") slots = std::atoi(next());
+            else if (arg == "--slot-bytes") slot_bytes = std::strtoull(next(), nullptr, 0);
+            else if (arg == "--tokens") a.tokens = std::atoi(next());
+            else if (arg == "--experts") a.experts = std::atoi(next());
+            else if (arg == "--topk") a.top_k = std::atoi(next());
+            else if (arg == "--hidden") a.hidden = std::atoi(next());
+            else if (arg == "--ffn-dim") a.ffn = std::atoi(next());
+            else if (arg == "--iters") a.iters = std::atoi(next());
+            else if (arg == "--skew") a.skew = std::atof(next());
+            else if (arg == "--dump") a.dump = next();
+            else throw std::invalid_argument("unknown argument " + arg);
+        }
+        ShmWire wire(MPI_COMM_WORLD, {slots, slot_bytes, g_device});
+        g_exchanger = std::make_unique<PeerExchanger>(&wire);
+        status = ffn_mode ? run_ffn(a) : run_probe();
+        MPI_Barrier(MPI_COMM_WORLD);  // peers may still read this rank's region
+        g_exchanger.reset();
+    } catch (const std::exception& error) {
+        std::printf("rank %d error: %s\n", g_rank, error.what());
+        std::fflush(stdout);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    MPI_Finalize();
+    return status;
+}

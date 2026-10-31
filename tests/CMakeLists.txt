@@ -131,6 +131,22 @@ if(NANO_NCCL_ENABLE_MPI)
         endforeach()
     endif()
 
+    # EP MoE layer over ShmWire; the probe matrix is bit-exact, --ffn runs
+    # real experts (checked by ep_moe_reference.py).
+    add_executable(nano_nccl_ep_moe_test ep_moe_test.cu)
+    target_link_libraries(nano_nccl_ep_moe_test PRIVATE nano_nccl_ep nano_nccl_peer_shm)
+    if(BUILD_TESTING)
+        foreach(np IN ITEMS 2 4)
+            add_test(
+                NAME nano_nccl_ep_moe_probe_np${np}
+                COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${np}
+                        --bind-to none --mca btl ^openib
+                        $<TARGET_FILE:nano_nccl_ep_moe_test> --slots 2 --slot-bytes 65536
+            )
+            set_tests_properties(nano_nccl_ep_moe_probe_np${np} PROPERTIES TIMEOUT 600)
+        endforeach()
+    endif()
+
     add_executable(nano_nccl_mpi_device_selection mpi_device_selection.cc)
     target_link_libraries(nano_nccl_mpi_device_selection PRIVATE
         nano_nccl_mpi MPI::MPI_C)
