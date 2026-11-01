@@ -39,14 +39,27 @@
 // arrived, whether it arrived before or after the call. Tags are unique per
 // (src, dst) pair and direction (data: 2 * seq, credit: 2 * n + 1).
 //
-// Network copies do not use the PCIe copy engines here, so remote_busy() is
-// 0: no GPU slowdown from them.
+// With NetConfig::host_staged the remote path matches RdmaWire (host-pinned,
+// src/transport/peer/rdma_wire.h) instead of a GPUDirect write:
+//
+//   write_chunk to a peer  -> a staging copy on the sender's tx engine
+//                             (tx_remote cost: device -> pinned host); the
+//                             write op is done when it ends, and only then is
+//                             the chunk sent;
+//   slot reuse             -> released() is min(credits, sends completed in
+//                             order), as a staging slot is reused only after
+//                             its send completed;
+//   copy_out               -> host -> device on the rx engine (rx_remote).
+//
+// Network transfers themselves do not occupy the PCIe copy engines, so
+// remote_busy() is 0: no GPU slowdown from them.
 namespace nano_nccl::sim::simai {
 
 struct NetConfig {
     std::size_t header_bytes = sizeof(transport::peer::ChunkHeader);  // sent with every chunk
     std::size_t credit_bytes = 64;
     double arrival_latency = 0;  // receiver sees the arrival this long after delivery (us)
+    bool host_staged = false;    // RdmaWire semantics (see above), else GPUDirect write
 };
 
 class NetFabric final : public Fabric {
@@ -82,6 +95,7 @@ private:
     void send(int src, int dst, int tag, std::uint64_t bytes, double at, std::function<void()> on_sent,
               std::function<void()> on_received);
     void delivered(int src, int dst, std::uint64_t seq);
+    void send_completed(int src, int dst, std::uint64_t seq);
 
     Scheduler& sched_;
     HostModel& host_;
@@ -97,6 +111,8 @@ private:
     std::vector<std::set<std::uint64_t>> delivered_;                  // [src * n + dst], not yet in order
     std::vector<std::uint64_t> in_order_;                             // [src * n + dst], delivered in order
     std::vector<std::uint64_t> credits_sent_;                         // [src * n + dst]: credit messages dst -> src
+    std::vector<std::set<std::uint64_t>> send_done_set_;              // [src * n + dst], not yet in order
+    std::vector<std::uint64_t> acked_;                                // [src * n + dst], sends completed in order
     std::vector<LinkStats> links_;
     std::vector<EngineStats> tx_stats_, rx_stats_;
     std::uint64_t sent_ = 0, send_done_ = 0, recv_done_ = 0;

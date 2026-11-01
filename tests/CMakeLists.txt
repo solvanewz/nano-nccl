@@ -152,6 +152,26 @@ if(NANO_NCCL_ENABLE_MPI)
         endforeach()
     endif()
 
+    if(NANO_NCCL_ENABLE_RDMA)
+        # EP peer exchange over RdmaWire. --copier host needs no GPU (Soft-RoCE
+        # is enough); exits 77 without an active RDMA device.
+        add_executable(nano_nccl_peer_rdma_wire_test peer_rdma_wire_test.cc)
+        target_link_libraries(nano_nccl_peer_rdma_wire_test PRIVATE nano_nccl_peer_rdma)
+        target_compile_options(nano_nccl_peer_rdma_wire_test PRIVATE -O2 -Wall -Wextra)
+        if(BUILD_TESTING)
+            foreach(np IN ITEMS 2 4)
+                add_test(
+                    NAME nano_nccl_peer_rdma_wire_np${np}
+                    COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${np}
+                            --bind-to none --mca btl ^openib
+                            $<TARGET_FILE:nano_nccl_peer_rdma_wire_test> --copier host
+                )
+                set_tests_properties(nano_nccl_peer_rdma_wire_np${np} PROPERTIES
+                    TIMEOUT 900 SKIP_RETURN_CODE 77)
+            endforeach()
+        endif()
+    endif()
+
     # EP MoE layer over ShmWire; the probe matrix is bit-exact, --ffn runs
     # real experts (checked by ep_moe_reference.py).
     add_executable(nano_nccl_ep_moe_test ep_moe_test.cu)

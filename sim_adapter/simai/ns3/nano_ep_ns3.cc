@@ -12,13 +12,15 @@
 //       completed (the minimal send -> completion callback case).
 //   nano_ep_ns3 --profile P [--trace T | synthetic options as nano_ep_sim]
 //               [--world W --gbps G --latency-us L --out DIR]
-//               [--backend ns3|analytical]
+//               [--backend ns3|analytical] [--staged]
 //       one layer invocation; host and GPU costs from the profile, network
 //       from ns-3. The topology is a star: W GPU nodes on one switch, links of
 //       G Gb/s and L us; the ns-3 inputs and outputs go to DIR. With
 //       --backend analytical the same layer runs over the analytical network
 //       (one port per node at G Gb/s, 2 L per message) on the simulator's
-//       own event loop, as a cross-check.
+//       own event loop, as a cross-check. --staged models RdmaWire's
+//       host-pinned path (staging copy, then send) instead of GPUDirect
+//       writes (NetConfig::host_staged).
 #include "analytical_network.h"
 #include "astra_scheduler.h"
 #include "cost_profile.h"
@@ -176,6 +178,7 @@ struct Args {
     std::string mode = "ffn";
     int gbps = 100;
     double latency_us = 1.0;
+    bool staged = false;  // host-staged sends (RdmaWire semantics), else GPUDirect writes
 };
 
 // SimAI's example ns-3 configuration (inputs/config/SimAI.conf) with the
@@ -343,7 +346,10 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
     }
     auto factory = [&](nsim::Scheduler& s, nsim::HostModel& host, int world, int slots, std::size_t slot_bytes,
                        std::vector<nsim::WireCosts> costs) -> std::unique_ptr<nsim::Fabric> {
-        auto f = std::make_unique<nsim::simai::NetFabric>(s, host, world, slots, slot_bytes, std::move(costs), eps);
+        nsim::simai::NetConfig config;
+        config.host_staged = a.staged;
+        auto f = std::make_unique<nsim::simai::NetFabric>(s, host, world, slots, slot_bytes, std::move(costs), eps,
+                                                          config);
         *fabric_out = f.get();
         return f;
     };
@@ -356,8 +362,9 @@ int report(const Args& a, const nsim::SimResult& res, const nsim::simai::NetFabr
     const nsim::simai::NetFabric* fabric = &fabric_ref;
     const nsim::SimRankResult& r0 = res.ranks[0];
     const Stages s = slowest_stages(res);
-    std::printf("# %s star: %d GPUs, %d Gb/s, %.2f us per link; %d steps, %zu ops per rank\n", a.backend.c_str(),
-                static_cast<int>(res.ranks.size()), a.gbps, a.latency_us, r0.program.steps, r0.program.ops.size());
+    std::printf("# %s star: %d GPUs, %d Gb/s, %.2f us per link, %s; %d steps, %zu ops per rank\n",
+                a.backend.c_str(), static_cast<int>(res.ranks.size()), a.gbps, a.latency_us,
+                a.staged ? "host-staged" : "GPUDirect", r0.program.steps, r0.program.ops.size());
     std::printf("  route %.1f  counts %.1f  pipeline %.1f  reduce %.1f  total %.1f (us, slowest rank)\n", s.route,
                 s.counts, s.pipeline, s.reduce, s.total);
     std::printf("# network messages %llu, sends completed %llu, receives completed %llu\n",
@@ -401,6 +408,7 @@ int main(int argc, char** argv) {
             else if (arg == "--gbps") a.gbps = std::atoi(next());
             else if (arg == "--latency-us") a.latency_us = std::atof(next());
             else if (arg == "--backend") a.backend = next();
+            else if (arg == "--staged") a.staged = true;
             else throw std::invalid_argument("unknown option " + arg);
         }
         const int speeds[] = {25, 50, 100, 200, 400, 1600};  // ECN maps of SimAI.conf

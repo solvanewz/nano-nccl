@@ -45,6 +45,7 @@ using nano_nccl::sim::Table;
 using nano_nccl::sim::WireCosts;
 using nano_nccl::sim::simai::AnalyticalNetwork;
 using nano_nccl::sim::simai::AstraScheduler;
+using nano_nccl::sim::simai::NetConfig;
 using nano_nccl::sim::simai::NetFabric;
 namespace cost = nano_nccl::sim::cost;
 
@@ -74,7 +75,7 @@ CostProfile profile() {
     t(cost::kExpertFfn, {{1, 10}, {1000, 30}, {10000, 200}});
     t(cost::kExpertProbe, {{0, 1}, {10000, 5}});
     t(cost::kReduce, {{0, 2}, {10000, 12}});
-    t(cost::kTxRemote, {{4096, 1.0}, {1 << 20, 80}});  // unused by NetFabric
+    t(cost::kTxRemote, {{4096, 1.0}, {1 << 20, 80}});  // NetFabric: host-staged only
     t(cost::kRxRemote, {{4096, 1.0}, {1 << 20, 80}});
     t(cost::kTxSelf, {{4096, 0.5}, {1 << 20, 4}});
     t(cost::kRxSelf, {{4096, 0.5}, {1 << 20, 4}});
@@ -128,14 +129,16 @@ struct Run {
 };
 
 Run run_layer(const SimLayerConfig& c, const std::vector<std::vector<std::int64_t>>& counts,
-              const std::vector<int>& tokens, const CostProfile& p, double gbps, double latency_us) {
+              const std::vector<int>& tokens, const CostProfile& p, double gbps, double latency_us,
+              NetConfig config = {}) {
     EventQueue q;
     AnalyticalNetwork net(q, c.world, gbps, latency_us);
     AstraScheduler sched(net.endpoint(0));
     NetFabric* fabric = nullptr;
     auto factory = [&](Scheduler& s, HostModel& host, int world, int slots, std::size_t slot_bytes,
                        std::vector<WireCosts> costs) -> std::unique_ptr<Fabric> {
-        auto f = std::make_unique<NetFabric>(s, host, world, slots, slot_bytes, std::move(costs), net.endpoints());
+        auto f = std::make_unique<NetFabric>(s, host, world, slots, slot_bytes, std::move(costs), net.endpoints(),
+                                             config);
         fabric = f.get();
         return f;
     };
@@ -152,7 +155,9 @@ Run run_layer(const SimLayerConfig& c, const std::vector<std::vector<std::int64_
     return r;
 }
 
-void check_run(const SimLayerConfig& c, const Run& r, double gbps, double latency_us) {
+// `staged` (NetConfig::host_staged) needs the profile for the staging cost.
+void check_run(const SimLayerConfig& c, const Run& r, double gbps, double latency_us, bool staged = false,
+               const CostProfile* p = nullptr) {
     const int W = c.world;
     require(r.sent == r.send_done && r.sent == r.recv_done,
             "messages sent " + std::to_string(r.sent) + ", sends completed " + std::to_string(r.send_done) +
@@ -177,13 +182,21 @@ void check_run(const SimLayerConfig& c, const Run& r, double gbps, double latenc
             const auto& in = nano_nccl::exec::exchange_layout(rk.program, static_cast<int>(i), rk.plan);
             // The send buffer is reusable only once every remote byte left
             // this rank's port.
+            // (Staged: once it was copied to the staging slots, earlier.)
             double out_bytes = 0;
             for (int s = 0; s < W; ++s) out_bytes += s == d ? 0.0 : static_cast<double>(in.send_bytes[s]);
-            require(at(Condition::kSendBufferReusable) >= rk.ops[i].issue_begin + out_bytes / bytes_per_us - 1e-6,
-                    "send buffer of op " + std::to_string(i) + " reusable before its bytes were sent");
+            if (!staged) {
+                require(at(Condition::kSendBufferReusable) >= rk.ops[i].issue_begin + out_bytes / bytes_per_us - 1e-6,
+                        "send buffer of op " + std::to_string(i) + " reusable before its bytes were sent");
+            }
             for (int s = 0; s < W; ++s) {
                 if (s == d || in.recv_bytes[s] == 0) continue;
-                const double cross = static_cast<double>(in.recv_bytes[s]) / bytes_per_us + latency_us;
+                double cross = static_cast<double>(in.recv_bytes[s]) / bytes_per_us + latency_us;
+                if (staged) {
+                    // The first chunk is staged before anything is sent.
+                    const double first = static_cast<double>(std::min(in.recv_bytes[s], c.slot_bytes));
+                    cross += WireCosts::from_profile(*p, false, s).tx_remote(first);
+                }
                 require(at(Condition::kPayloadArrived) >= r.res.ranks[s].ops[i].issue_begin + cross - 1e-6,
                         "payload " + std::to_string(s) + "->" + std::to_string(d) + " of op " + std::to_string(i) +
                             " arrived before it could cross the network");
@@ -222,11 +235,14 @@ void test_random(int trials) {
             tokens[r] = (sum + 1) / 2;
         }
         const double gbps = 25.0 * (1 + rng() % 16), lat = 0.5 * (rng() % 8);
+        NetConfig config;
+        config.host_staged = rng() % 2 == 0;
         try {
-            const Run r = run_layer(c, counts, tokens, p, gbps, lat);
-            check_run(c, r, gbps, lat);
+            const Run r = run_layer(c, counts, tokens, p, gbps, lat, config);
+            check_run(c, r, gbps, lat, config.host_staged, &p);
         } catch (const std::exception& e) {
-            throw std::runtime_error("trial " + std::to_string(t) + " (W=" + std::to_string(c.world) + " groups=" +
+            throw std::runtime_error("trial " + std::to_string(t) + " (W=" + std::to_string(c.world) +
+                                     (config.host_staged ? " staged" : "") + " groups=" +
                                      std::to_string(groups) + " slots=" + std::to_string(c.slots_per_link) +
                                      " slot_bytes=" + std::to_string(c.slot_bytes) + "): " + e.what());
         }
@@ -278,17 +294,71 @@ void test_credits() {
     std::vector<std::vector<std::int64_t>> counts(2, std::vector<std::int64_t>(2, 64));
     std::vector<int> tokens(2, 64);
     const double latency = 50;
-    const Run r = run_layer(c, counts, tokens, p, 100, latency);
-    check_run(c, r, 100, latency);
-    const auto& rk = r.res.ranks[1];
-    const int d = rk.program.dispatch[0];
-    const auto& in = nano_nccl::exec::exchange_layout(rk.program, d, rk.plan);
-    const std::size_t chunks = (in.recv_bytes[0] + c.slot_bytes - 1) / c.slot_bytes;
-    require(chunks >= 4, "test needs several chunks");
-    const double arrived = rk.ops[d].condition[static_cast<int>(Condition::kPayloadArrived)];
-    const double bound = r.res.ranks[0].ops[d].issue_begin + static_cast<double>(2 * chunks - 1) * latency;
-    require(arrived >= bound, "chunks did not wait for credits: arrived at " + std::to_string(arrived) +
-                                  " us, bound " + std::to_string(bound) + " us");
+    for (bool staged : {false, true}) {
+        NetConfig config;
+        config.host_staged = staged;
+        const Run r = run_layer(c, counts, tokens, p, 100, latency, config);
+        check_run(c, r, 100, latency, staged, &p);
+        const auto& rk = r.res.ranks[1];
+        const int d = rk.program.dispatch[0];
+        const auto& in = nano_nccl::exec::exchange_layout(rk.program, d, rk.plan);
+        const std::size_t chunks = (in.recv_bytes[0] + c.slot_bytes - 1) / c.slot_bytes;
+        require(chunks >= 4, "test needs several chunks");
+        const double arrived = rk.ops[d].condition[static_cast<int>(Condition::kPayloadArrived)];
+        const double bound = r.res.ranks[0].ops[d].issue_begin + static_cast<double>(2 * chunks - 1) * latency;
+        require(arrived >= bound, std::string(staged ? "staged: " : "") + "chunks did not wait for credits: arrived at " +
+                                      std::to_string(arrived) + " us, bound " + std::to_string(bound) + " us");
+    }
+}
+
+// 5. Host-staged sends (RdmaWire semantics) against GPUDirect writes, on a
+// slow network: the staged send buffer is free once it is copied, long before
+// its bytes could cross the wire, and copy-outs come from host memory (more
+// rx engine time). The layer is not necessarily slower: freeing send buffers
+// early can let later steps start sooner.
+void test_staged() {
+    const CostProfile p = profile();
+    SimLayerConfig c;
+    c.world = 4;
+    c.num_experts = 16;
+    c.top_k = 2;
+    c.hidden = 1024;
+    c.ffn = 512;
+    c.groups = nano_nccl::planner::fixed_group_plan(4, 16, 4);
+    c.options = {true, 1};
+    c.slots_per_link = 4;
+    c.slot_bytes = 65536;
+    std::vector<std::vector<std::int64_t>> counts(4, std::vector<std::int64_t>(16, 256));
+    std::vector<int> tokens(4, 256 * 16 / 2);
+    const double gbps = 25, latency = 1;
+    NetConfig staged_config;
+    staged_config.host_staged = true;
+    const Run direct = run_layer(c, counts, tokens, p, gbps, latency);
+    const Run staged = run_layer(c, counts, tokens, p, gbps, latency, staged_config);
+    check_run(c, direct, gbps, latency);
+    check_run(c, staged, gbps, latency, true, &p);
+    double rx_direct = 0, rx_staged = 0;
+    for (int d = 0; d < c.world; ++d) {
+        rx_direct += direct.res.rx[d].busy;
+        rx_staged += staged.res.rx[d].busy;
+    }
+    require(rx_staged > rx_direct * 2, "staged copy-outs did not read from host memory (rx busy " +
+                                           std::to_string(rx_staged) + " vs " + std::to_string(rx_direct) + " us)");
+    const double bytes_per_us = gbps * 1e3 / 8.0;
+    int early = 0;
+    for (int d = 0; d < c.world; ++d) {
+        const auto& rk = staged.res.ranks[d];
+        for (int i : rk.program.dispatch) {
+            const auto& in = nano_nccl::exec::exchange_layout(rk.program, i, rk.plan);
+            double out_bytes = 0;
+            for (int s = 0; s < c.world; ++s) out_bytes += s == d ? 0.0 : static_cast<double>(in.send_bytes[s]);
+            const double reusable = rk.ops[i].condition[static_cast<int>(Condition::kSendBufferReusable)];
+            if (reusable < rk.ops[i].issue_begin + out_bytes / bytes_per_us) ++early;
+        }
+    }
+    require(early > 0, "no staged send buffer was free before its bytes could be sent");
+    std::printf("  W=4 G4 L1 25 Gb/s: GPUDirect %.0f us, host-staged %.0f us; %d dispatches freed early\n",
+                direct.res.makespan, staged.res.makespan, early);
 }
 
 }  // namespace
@@ -298,6 +368,7 @@ int main() {
     check("random_worlds", [] { test_random(200); });
     check("timing", test_timing);
     check("credit_round_trips", test_credits);
+    check("staged_vs_gpudirect", test_staged);
     std::printf("simai_bridge=%s\n", g_failed == 0 ? "PASS" : "FAIL");
     return g_failed == 0 ? 0 : 1;
 }

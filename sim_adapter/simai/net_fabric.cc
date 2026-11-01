@@ -41,7 +41,11 @@ public:
     int slots_per_link() const override { return f_.slots_; }
     std::size_t slot_bytes() const override { return f_.slot_bytes_; }
 
-    std::uint64_t released(int dst) override { return f_.released_[f_.index(rank_, dst)]; }
+    std::uint64_t released(int dst) override {
+        const std::size_t l = f_.index(rank_, dst);
+        if (f_.config_.host_staged && dst != rank_) return std::min(f_.released_[l], f_.acked_[l]);
+        return f_.released_[l];
+    }
 
     OpId write_chunk(int dst, std::uint64_t seq, const ChunkHeader& header, const std::byte*) override {
         check(dst);
@@ -73,6 +77,20 @@ public:
                 f_.host_.wake(rank_, end);
             });
             self_pending_.push_back({seq, op});
+        } else if (f_.config_.host_staged) {
+            // RdmaWire: stage into pinned host memory, then send from there.
+            const double dur = header.bytes == 0 ? 0.0 : costs().tx_remote(static_cast<double>(header.bytes));
+            const double start = std::max(clock + (tx_free_ <= clock ? costs().copy_latency : 0.0), tx_free_);
+            tx_free_ = start + dur;
+            f_.tx_stats_[rank_].busy += dur;
+            const double end = tx_free_;
+            f_.sched_.schedule_at(end, [this, op, end] {
+                ops_[op] = true;
+                f_.host_.wake(rank_, end);
+            });
+            f_.send(rank_, dst, static_cast<int>(2 * seq), header.bytes + f_.config_.header_bytes, end,
+                    [this, dst, seq] { f_.send_completed(rank_, dst, seq); },
+                    [this, dst, seq] { f_.delivered(rank_, dst, seq); });
         } else {
             const double at = clock;
             f_.send(rank_, dst, static_cast<int>(2 * seq), header.bytes + f_.config_.header_bytes, at,
@@ -102,7 +120,10 @@ public:
         if (bytes == 0 || bytes > f_.slot_bytes_) throw std::invalid_argument("NetWire::copy_out: bad size");
         double& clock = f_.host_.host_clock(rank_);
         clock += costs().host_copy_out;
-        const double dur = costs().rx_self(static_cast<double>(bytes));
+        // The slot is in device memory (GPUDirect) or pinned host memory (staged).
+        const bool host_slot = f_.config_.host_staged && src != rank_;
+        const double dur = host_slot ? costs().rx_remote(static_cast<double>(bytes))
+                                     : costs().rx_self(static_cast<double>(bytes));
         const double start = std::max(clock + (rx_free_ <= clock ? costs().copy_latency : 0.0), rx_free_);
         rx_free_ = start + dur;
         auto& st = f_.rx_stats_[rank_];
@@ -192,6 +213,8 @@ NetFabric::NetFabric(Scheduler& scheduler, HostModel& host, int nranks, int slot
     delivered_.assign(links, {});
     in_order_.assign(links, 0);
     credits_sent_.assign(links, 0);
+    send_done_set_.assign(links, {});
+    acked_.assign(links, 0);
     links_.assign(links, {});
     tx_stats_.assign(nranks, {});
     rx_stats_.assign(nranks, {});
@@ -228,6 +251,20 @@ void NetFabric::send(int src, int dst, int tag, std::uint64_t bytes, double at, 
         net_[src]->sim_send(nullptr, bytes, AstraSim::UINT8, dst, tag, &req, &NetFabric::on_callback,
                             new Callback{this, std::move(on_sent), true});
     });
+}
+
+// Staged mode: the send of chunk `seq` src -> dst completed; the sender sees
+// completions in order (one RC QP per link), and may reuse staging slots.
+void NetFabric::send_completed(int src, int dst, std::uint64_t seq) {
+    const std::size_t l = index(src, dst);
+    const double now = sched_.now();
+    send_done_set_[l].insert(seq);
+    std::uint64_t& upto = acked_[l];
+    while (!send_done_set_[l].empty() && *send_done_set_[l].begin() == upto) {
+        send_done_set_[l].erase(send_done_set_[l].begin());
+        ++upto;
+    }
+    host_.wake(src, now);
 }
 
 // A chunk src -> dst was delivered; arrivals become visible in order.

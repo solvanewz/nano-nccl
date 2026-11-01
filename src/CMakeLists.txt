@@ -41,6 +41,7 @@ add_nano_nccl_library(nano_nccl)
 add_library(nano_nccl_peer STATIC
     transport/peer/peer_types.cc
     transport/peer/peer_exchanger.cc
+    transport/peer/local_copier.cc
 )
 set_target_properties(nano_nccl_peer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(nano_nccl_peer PUBLIC ${CMAKE_SOURCE_DIR}/src)
@@ -155,14 +156,41 @@ if(NANO_NCCL_ENABLE_MPI)
     if(NANO_NCCL_ENABLE_RDMA)
         # target_sources 由各 rdma 源文件任务渐进追加:
         #   Task 4 -> rdma_endpoint.cc, Task 5 -> rdma_qp.cc, Task 6 -> rdma_proxy.cc
-        target_sources(nano_nccl PRIVATE transport/rdma/rdma_endpoint.cc)
-        target_sources(nano_nccl PRIVATE transport/rdma/rdma_qp.cc)
+        # Device/QP setup is plain verbs, shared with the EP RdmaWire, which
+        # must not depend on the CUDA driver (it is tested on hosts without one).
+        add_library(nano_nccl_rdma_verbs STATIC
+            transport/rdma/rdma_endpoint.cc
+            transport/rdma/rdma_qp.cc
+        )
+        set_target_properties(nano_nccl_rdma_verbs PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(nano_nccl_rdma_verbs PUBLIC ${CMAKE_SOURCE_DIR}/src)
+        target_compile_options(nano_nccl_rdma_verbs PRIVATE -O3)
+        target_link_libraries(nano_nccl_rdma_verbs PUBLIC ${IBVERBS_LIBRARY})
+        target_link_libraries(nano_nccl PUBLIC nano_nccl_rdma_verbs)
         target_sources(nano_nccl PRIVATE transport/rdma/rdma_proxy.cc)
         target_sources(nano_nccl PRIVATE transport/rdma/rdma_progress.cc)
         target_sources(nano_nccl PRIVATE transport/rdma/rdma_gdr.cc)
         target_link_libraries(nano_nccl PRIVATE ${IBVERBS_LIBRARY} CUDA::cuda_driver)
         target_compile_definitions(nano_nccl PUBLIC NANO_NCCL_ENABLE_RDMA=1)
         target_link_libraries(nano_nccl_mpi PRIVATE ${IBVERBS_LIBRARY})
+
+        # EP peer exchange over RDMA verbs (B1, host-pinned staging). Links
+        # cudart but not the CUDA driver, so its CPU-only test (host copier)
+        # runs on hosts without a GPU, e.g. over Soft-RoCE.
+        add_library(nano_nccl_peer_rdma STATIC
+            transport/peer/rdma_wire.cc
+            transport/peer/cuda_copier.cc
+        )
+        set_target_properties(nano_nccl_peer_rdma PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(nano_nccl_peer_rdma PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/src
+            ${nano_nccl_mpi_include_dirs}
+        )
+        target_compile_options(nano_nccl_peer_rdma PRIVATE -O2 -Wall -Wextra)
+        target_compile_definitions(nano_nccl_peer_rdma PUBLIC OMPI_SKIP_MPICXX)
+        target_link_libraries(nano_nccl_peer_rdma PUBLIC
+            nano_nccl_peer nano_nccl_rdma_verbs CUDA::cudart MPI::MPI_C ${IBVERBS_LIBRARY})
     endif()
 
     if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)
