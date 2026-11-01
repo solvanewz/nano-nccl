@@ -9,6 +9,10 @@ namespace nano_nccl::sim {
 using transport::peer::ChunkHeader;
 using transport::peer::PeerWire;
 
+namespace {
+constexpr double kMiB = 1024.0 * 1024.0;
+}  // namespace
+
 WireCosts WireCosts::from_profile(const CostProfile& p, bool contention, int rank) {
     WireCosts c;
     if (contention && p.tables.count(cost::kTxRemoteAlone) && p.tables.count(cost::kRxRemoteAlone)) {
@@ -17,11 +21,29 @@ WireCosts WireCosts::from_profile(const CostProfile& p, bool contention, int ran
         c.rx_remote_alone = p.table_for(cost::kRxRemoteAlone, rank);
         c.tx_compute_factor = p.scalar_or(cost::kCopyTxComputeFactor, 1.0);
         c.rx_compute_factor = p.scalar_or(cost::kCopyRxComputeFactor, 1.0);
+        if (p.tables.count(cost::kTxRemoteInsitu) && p.tables.count(cost::kRxRemoteInsitu)) {
+            c.insitu = true;
+            c.tx_insitu = p.table_for(cost::kTxRemoteInsitu, rank);
+            c.rx_insitu = p.table_for(cost::kRxRemoteInsitu, rank);
+        }
     }
     c.tx_remote = p.table_for(cost::kTxRemote, rank);
     c.rx_remote = p.table_for(cost::kRxRemote, rank);
-    c.tx_switch = p.scalar_for(cost::kTxSwitch, rank, 0);
-    c.rx_switch = p.scalar_for(cost::kRxSwitch, rank, 0);
+    auto turnaround = [&](double (&turn)[2][2], const std::string& prefix, const char* sw) {
+        const char* kinds[2] = {"r", "s"};
+        bool insitu = true;
+        for (const char* a : kinds) {
+            for (const char* b : kinds) insitu = insitu && p.scalars.count(prefix + a + b);
+        }
+        for (int a = 0; a < 2; ++a) {
+            for (int b = 0; b < 2; ++b) {
+                turn[a][b] = insitu ? p.scalar_for(prefix + kinds[a] + kinds[b], rank, 0)
+                                    : (a != b ? p.scalar_for(sw, rank, 0) : 0.0);
+            }
+        }
+    };
+    turnaround(c.tx_turn, cost::kTxTurnaround, cost::kTxSwitch);
+    turnaround(c.rx_turn, cost::kRxTurnaround, cost::kRxSwitch);
     c.tx_self = p.table(cost::kTxSelf);
     c.rx_self = p.table(cost::kRxSelf);
     c.host_post = p.scalar(cost::kHostPost);
@@ -58,23 +80,16 @@ public:
         clock += costs().host_post;
         f_.slot(dst, rank_, seq) = header;
         const bool self = dst == rank_;
-        const double start = engine_start(tx_free_, clock, tx_last_self_, self && header.bytes != 0, header.bytes != 0, true);
-        const double dur = header.bytes == 0 ? 0.0 : copy_cost(true, self, header.bytes, start);
-        const double end = start + dur;
-        tx_free_ = end;
-        if (!self && header.bytes != 0) f_.tx_remote_until_[rank_] = end;
-        auto& st = f_.tx_stats_[rank_];
-        st.busy += dur;
-        ++st.copies;
+        ++f_.tx_stats_[rank_].copies;
         LinkStats& ls = f_.links_[link(rank_, dst)];
         ++ls.chunks;
         ls.bytes += header.bytes;
         ls.max_in_flight = std::max<std::uint32_t>(ls.max_in_flight, static_cast<std::uint32_t>(seq + 1 - released(dst)));
         const OpId op = new_op();
-        f_.queue_.schedule_at(end, [this, op, end] {
-            ops_[op] = true;
-            f_.host_.wake(rank_, end);
-        });
+        f_.enqueue(rank_, 0, {header.bytes, self, header.bytes != 0, clock, [this, op](double end) {
+                                  ops_[op] = true;
+                                  f_.host_.wake(rank_, end);
+                              }});
         tx_pending_[dst].push_back({seq, op});
         ++tx_next_[dst];
         f_.host_.note_activity(rank_);
@@ -96,19 +111,12 @@ public:
         double& clock = f_.host_.host_clock(rank_);
         clock += costs().host_copy_out;
         const bool self = src == rank_;
-        const double start = engine_start(rx_free_, clock, rx_last_self_, self, true, false);
-        const double dur = copy_cost(false, self, bytes, start);
-        const double end = start + dur;
-        rx_free_ = end;
-        if (!self) f_.rx_remote_until_[rank_] = end;
-        auto& st = f_.rx_stats_[rank_];
-        st.busy += dur;
-        ++st.copies;
+        ++f_.rx_stats_[rank_].copies;
         const OpId op = new_op();
-        f_.queue_.schedule_at(end, [this, op, end] {
-            ops_[op] = true;
-            f_.host_.wake(rank_, end);
-        });
+        f_.enqueue(rank_, 1, {bytes, self, true, clock, [this, op](double end) {
+                                  ops_[op] = true;
+                                  f_.host_.wake(rank_, end);
+                              }});
         f_.host_.note_activity(rank_);
         return op;
     }
@@ -162,39 +170,7 @@ private:
         ops_.push_back(false);
         return ops_.size() - 1;
     }
-    // FIFO engine: a copy starts at its issue time (plus the launch latency
-    // when the engine is idle) or when the previous copy ends.
-    // A queued copy of the other kind than the engine's previous one waits
-    // the switch stall; `copies` is false for header-only chunks.
-    double engine_start(double free_at, double issue, int& last_self, bool self, bool copies, bool tx) const {
-        if (free_at <= issue) {
-            if (copies) last_self = self ? 1 : 0;
-            return issue + costs().copy_latency;
-        }
-        double start = free_at;
-        if (copies) {
-            if (last_self >= 0 && last_self != (self ? 1 : 0)) start += tx ? costs().tx_switch : costs().rx_switch;
-            last_self = self ? 1 : 0;
-        }
-        return start;
-    }
     const WireCosts& costs() const { return f_.costs_[rank_]; }
-    double copy_cost(bool tx, bool self, std::size_t bytes, double start) const {
-        const WireCosts& c = costs();
-        const double b = static_cast<double>(bytes);
-        if (self) return c.copy_scale * (tx ? c.tx_self : c.rx_self)(b);
-        const double busy = (tx ? c.tx_remote : c.rx_remote)(b);
-        if (!c.contention) return c.copy_scale * busy;
-        int others = 0;
-        for (int r = 0; r < f_.nranks_; ++r) {
-            others += (f_.tx_remote_until_[r] > start && !(tx && r == rank_)) ? 1 : 0;
-            others += (f_.rx_remote_until_[r] > start && !(!tx && r == rank_)) ? 1 : 0;
-        }
-        const double alone = (tx ? c.tx_remote_alone : c.rx_remote_alone)(b);
-        double t = alone + (busy - alone) * std::min(1.0, others / 3.0);
-        if (f_.host_.gpu_busy(rank_, start)) t *= tx ? c.tx_compute_factor : c.rx_compute_factor;
-        return c.copy_scale * t;
-    }
 
     SimFabric& f_;
     int rank_;
@@ -202,11 +178,9 @@ private:
     std::vector<std::deque<Pending>> tx_pending_;
     std::vector<std::uint64_t> tx_next_;
     std::vector<std::uint64_t> rx_released_;
-    double tx_free_ = 0, rx_free_ = 0;
-    int tx_last_self_ = -1, rx_last_self_ = -1;  // kind of the engine's last copy
 };
 
-SimFabric::SimFabric(EventQueue& queue, HostModel& host, int nranks, int slots_per_link, std::size_t slot_bytes,
+SimFabric::SimFabric(Scheduler& queue, HostModel& host, int nranks, int slots_per_link, std::size_t slot_bytes,
                      std::vector<WireCosts> costs)
     : queue_(queue), host_(host), nranks_(nranks), slots_(slots_per_link), slot_bytes_(slot_bytes),
       costs_(std::move(costs)) {
@@ -219,8 +193,7 @@ SimFabric::SimFabric(EventQueue& queue, HostModel& host, int nranks, int slots_p
     links_.assign(links, {});
     tx_stats_.assign(nranks, {});
     rx_stats_.assign(nranks, {});
-    tx_remote_until_.assign(nranks, 0);
-    rx_remote_until_.assign(nranks, 0);
+    engines_.resize(static_cast<std::size_t>(nranks) * 2);
     for (int r = 0; r < nranks; ++r) wires_.push_back(std::make_unique<Wire>(*this, r));
 }
 
@@ -228,8 +201,123 @@ SimFabric::~SimFabric() = default;
 
 PeerWire& SimFabric::wire(int rank) { return *wires_.at(rank); }
 
-int SimFabric::remote_engines_busy(int rank, double t) const {
-    return (tx_remote_until_.at(rank) > t ? 1 : 0) + (rx_remote_until_.at(rank) > t ? 1 : 0);
+int SimFabric::remote_busy(int rank) const {
+    return (engine(rank, 0).remote ? 1 : 0) + (engine(rank, 1).remote ? 1 : 0);
+}
+
+// FIFO engine: a copy issued to an idle engine starts after the launch
+// latency; a queued one after the previous copy ends plus the turnaround for
+// the two kinds. Header-only chunks take no engine time.
+void SimFabric::enqueue(int rank, int dir, Job job) {
+    Engine& e = engine(rank, dir);
+    e.queue.push_back(std::move(job));
+    if (e.active) return;
+    e.active = true;
+    const double t = std::max(queue_.now(), e.queue.front().issue + costs_[rank].copy_latency);
+    queue_.schedule_at(t, [this, rank, dir, t] { start_job(rank, dir, t); });
+}
+
+void SimFabric::start_job(int rank, int dir, double t) {
+    Engine& e = engine(rank, dir);
+    e.cur = std::move(e.queue.front());
+    e.queue.pop_front();
+    e.running = true;
+    e.start = e.last = t;
+    if (!e.cur.copies) {
+        e.left = 0;
+        e.rate = 1;
+        finish_job(rank, dir, t);
+        return;
+    }
+    e.last_self = e.cur.self ? 1 : 0;
+    e.left = work(rank, dir, e.cur, t);
+    e.remote = !e.cur.self;
+    if (e.remote) {
+        // Both engines of the rank change speed, and its GPU work.
+        reschedule(rank, 0, t);
+        reschedule(rank, 1, t);
+        host_.remote_busy_changed(rank, t);
+    } else {
+        reschedule(rank, dir, t);
+    }
+}
+
+void SimFabric::finish_job(int rank, int dir, double t) {
+    Engine& e = engine(rank, dir);
+    const bool was_remote = e.remote;
+    e.running = false;
+    e.remote = false;
+    ++e.token;  // no end event of this job is pending any more
+    (dir == 0 ? tx_stats_ : rx_stats_)[rank].busy += t - e.start;
+    Job job = std::move(e.cur);
+    e.cur = Job{};
+    if (was_remote) {
+        reschedule(rank, 1 - dir, t);
+        host_.remote_busy_changed(rank, t);
+    }
+    if (e.queue.empty()) {
+        e.active = false;
+    } else {
+        const Job& next = e.queue.front();
+        const WireCosts& c = costs_[rank];
+        double at;
+        if (next.issue + c.copy_latency > t) {
+            at = next.issue + c.copy_latency;  // issued after the engine went idle
+        } else {
+            at = t;
+            if (next.copies && e.last_self >= 0) at += (dir == 0 ? c.tx_turn : c.rx_turn)[e.last_self][next.self ? 1 : 0];
+        }
+        queue_.schedule_at(at, [this, rank, dir, at] { start_job(rank, dir, at); });
+    }
+    job.done(t);
+}
+
+double SimFabric::rate(int rank, int dir) const {
+    const Engine& e = engine(rank, dir);
+    const WireCosts& c = costs_[rank];
+    if (!e.remote || !c.insitu) return 1.0;
+    if (!engine(rank, 1 - dir).remote) return 1.0;
+    const Table& line = dir == 0 ? c.tx_insitu : c.rx_insitu;
+    return line(0) / line(1);
+}
+
+// Brings the running job of the engine up to time t at its old rate, then
+// schedules its end at the current rate.
+void SimFabric::reschedule(int rank, int dir, double t) {
+    Engine& e = engine(rank, dir);
+    if (!e.running) return;
+    e.left = std::max(0.0, e.left - (t - e.last) * e.rate);
+    e.last = t;
+    e.rate = rate(rank, dir);
+    const double end = t + e.left / e.rate;
+    const std::uint64_t token = ++e.token;
+    queue_.schedule_at(end, [this, rank, dir, end, token] {
+        if (engine(rank, dir).token == token) finish_job(rank, dir, end);
+    });
+}
+
+// Work of a copy: its duration at rate 1, priced when it starts.
+double SimFabric::work(int rank, int dir, const Job& job, double t) const {
+    const WireCosts& c = costs_[rank];
+    const bool tx = dir == 0;
+    const double b = static_cast<double>(job.bytes);
+    if (job.self) return c.copy_scale * (tx ? c.tx_self : c.rx_self)(b);
+    const double busy = (tx ? c.tx_remote : c.rx_remote)(b);
+    if (!c.contention) return c.copy_scale * busy;
+    if (c.insitu) {
+        const Table& shape = tx ? c.tx_remote : c.rx_remote;
+        return c.copy_scale * (tx ? c.tx_insitu : c.rx_insitu)(0) * shape(b) / shape(kMiB);
+    }
+    int others = 0;
+    for (int r = 0; r < nranks_; ++r) {
+        for (int d = 0; d < 2; ++d) {
+            if (!(r == rank && d == dir) && engine(r, d).remote) ++others;
+        }
+    }
+    const double alone = (tx ? c.tx_remote_alone : c.rx_remote_alone)(b);
+    double w = alone + (busy - alone) * std::min(1.0, others / 3.0);
+    if (host_.gpu_busy(rank, t)) w *= tx ? c.tx_compute_factor : c.rx_compute_factor;
+    return c.copy_scale * w;
 }
 
 ChunkHeader& SimFabric::slot(int owner, int src, std::uint64_t seq) {

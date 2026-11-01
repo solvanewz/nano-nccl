@@ -5,6 +5,8 @@
 #include "sim_wire.h"
 
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -65,8 +67,42 @@ struct SimResult {
     std::uint64_t events = 0;
 };
 
+// Builds the transport the ranks exchange over. `costs` holds the profile's
+// per-rank copy costs (WireCosts::from_profile).
+using FabricFactory = std::function<std::unique_ptr<Fabric>(
+    Scheduler& scheduler, HostModel& host, int world, int slots_per_link, std::size_t slot_bytes,
+    std::vector<WireCosts> costs)>;
+
+// The default: ShmWire-like host-staged copies (SimFabric).
+std::unique_ptr<Fabric> make_sim_fabric(Scheduler& scheduler, HostModel& host, int world, int slots_per_link,
+                                        std::size_t slot_bytes, std::vector<WireCosts> costs);
+
+// One layer invocation on an external event loop: start() schedules the
+// ranks (times are measured from the loop's time 0, so start before it
+// runs), the caller runs the loop, finish() collects the result (and throws
+// std::runtime_error when a rank did not retire: deadlock). on_all_retired
+// runs once every rank retired, e.g. to stop an event loop whose network
+// keeps timers running. The arguments must outlive the object.
+class LayerSimulation {
+public:
+    LayerSimulation(const SimLayerConfig& config, const std::vector<std::vector<std::int64_t>>& counts,
+                    const std::vector<int>& tokens, const CostProfile& profile, Scheduler& scheduler,
+                    const FabricFactory& fabric = make_sim_fabric);
+    ~LayerSimulation();
+    LayerSimulation(const LayerSimulation&) = delete;
+    LayerSimulation& operator=(const LayerSimulation&) = delete;
+
+    void start(std::function<void()> on_all_retired = {});
+    SimResult finish(std::uint64_t events = 0);
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
 // counts[r][e] = N(r, e); tokens[r] = tokens of rank r (only the route and
-// reduce costs use it). Throws std::runtime_error on deadlock.
+// reduce costs use it). Runs on the simulator's own EventQueue over a
+// SimFabric. Throws std::runtime_error on deadlock.
 SimResult simulate_layer(const SimLayerConfig& config, const std::vector<std::vector<std::int64_t>>& counts,
                          const std::vector<int>& tokens, const CostProfile& profile);
 

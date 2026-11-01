@@ -78,7 +78,22 @@ inline constexpr const char* kTxSelf = "copy_tx_self_us";
 // Stall when an engine switches between a remote and a self chunk (scalar).
 inline constexpr const char* kTxSwitch = "copy_tx_switch_us";
 inline constexpr const char* kRxSwitch = "copy_rx_switch_us";
+// In-situ engine turnaround, optional scalars: previous end -> start of a copy
+// that was already queued, by kind of the previous and this copy (r = remote,
+// s = self), e.g. "copy_tx_turnaround_us_rs" = remote then self. Measured by
+// sim_adapter/calibrate_copies.py; when present they replace the switch
+// stalls (and add a same-kind turnaround).
+inline constexpr const char* kTxTurnaround = "copy_tx_turnaround_us_";
+inline constexpr const char* kRxTurnaround = "copy_rx_turnaround_us_";
 inline constexpr const char* kRxSelf = "copy_rx_self_us";
+// In-situ remote copy cost, optional: x = fraction of the chunk overlapped by
+// the same GPU's remote copies in the other direction (0..1), y = us per MiB,
+// fitted on real multi-process runs (sim_adapter/calibrate_copies.py over
+// nsys reports). When present the contention model uses these instead of
+// interpolating between *_alone and the all-busy table; the all-busy table
+// then only gives the size dependence.
+inline constexpr const char* kTxRemoteInsitu = "copy_tx_remote_insitu_us_per_mib";
+inline constexpr const char* kRxRemoteInsitu = "copy_rx_remote_insitu_us_per_mib";
 // Host, scalars unless noted.
 inline constexpr const char* kHostRouteIssue = "host_route_issue_us";
 inline constexpr const char* kHostExpertIssue = "host_expert_issue_us";  // table, x: experts with rows
@@ -95,7 +110,10 @@ inline constexpr const char* kArrivalLatency = "arrival_latency_us";     // publ
 // Interference (ratios, optional; 1 when absent).
 inline constexpr const char* kCopyTxComputeFactor = "copy_tx_compute_factor";  // tx copy while its GPU computes
 inline constexpr const char* kCopyRxComputeFactor = "copy_rx_compute_factor";
-inline constexpr const char* kGpuCopySlowdown = "gpu_copy_slowdown";  // GPU op while both its engines copy
+// GPU op while both its engines copy remote chunks for all of it (scaled by
+// the covered fraction). benchmarks/ep_profile measures it in isolation;
+// sim_adapter/calibrate_copies.py --gpu-pair measures it per rank in situ.
+inline constexpr const char* kGpuCopySlowdown = "gpu_copy_slowdown";
 }  // namespace cost
 
 }  // namespace nano_nccl::sim

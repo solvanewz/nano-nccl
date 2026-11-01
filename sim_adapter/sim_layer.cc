@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -44,13 +45,16 @@ double gpu_cost(const CostProfile& p, const std::string& mode, OpKind kind, cons
     }
 }
 
-namespace {
+std::unique_ptr<Fabric> make_sim_fabric(Scheduler& scheduler, HostModel& host, int world, int slots_per_link,
+                                        std::size_t slot_bytes, std::vector<WireCosts> costs) {
+    return std::make_unique<SimFabric>(scheduler, host, world, slots_per_link, slot_bytes, std::move(costs));
+}
 
-class Simulation final : public HostModel {
+class LayerSimulation::Impl final : public HostModel {
 public:
-    Simulation(const SimLayerConfig& c, const std::vector<std::vector<std::int64_t>>& counts,
-               const std::vector<int>& tokens, const CostProfile& profile)
-        : c_(c), counts_(counts), tokens_(tokens), p_(profile) {
+    Impl(const SimLayerConfig& c, const std::vector<std::vector<std::int64_t>>& counts,
+         const std::vector<int>& tokens, const CostProfile& profile, Scheduler& q, const FabricFactory& fabric)
+        : c_(c), counts_(counts), tokens_(tokens), p_(profile), q_(q) {
         const int W = c.world;
         if (W < 1 || static_cast<int>(counts.size()) != W || static_cast<int>(tokens.size()) != W) {
             throw std::invalid_argument("simulate_layer: counts/tokens need one entry per rank");
@@ -65,10 +69,13 @@ public:
             wc.push_back(WireCosts::from_profile(profile, c.contention, r));
             wc.back().copy_scale = c.copy_scale;
         }
-        gpu_copy_slowdown_ = c.contention ? profile.scalar_or(cost::kGpuCopySlowdown, 1.0) : 1.0;
+        for (int r = 0; r < W; ++r) {
+            gpu_copy_slowdown_.push_back(c.contention ? profile.scalar_for(cost::kGpuCopySlowdown, r, 1.0) : 1.0);
+        }
         host_poll_ = profile.scalar(cost::kHostPoll);
         launch_latency_ = profile.scalar_or(cost::kLaunchLatency, 0);
-        fabric_ = std::make_unique<SimFabric>(q_, *this, W, c.slots_per_link, c.slot_bytes, wc);
+        fabric_ = fabric(q_, *this, W, c.slots_per_link, c.slot_bytes, wc);
+        if (!fabric_ || fabric_->nranks() != W) throw std::invalid_argument("simulate_layer: bad fabric");
         ranks_.resize(W);
         for (int r = 0; r < W; ++r) {
             Rank& k = ranks_[r];
@@ -88,9 +95,12 @@ public:
         }
     }
 
-    SimResult run() {
-        for (int r = 0; r < c_.world; ++r) wake(r, 0);
-        const std::uint64_t events = q_.run();
+    void start(std::function<void()> on_done) {
+        on_done_ = std::move(on_done);
+        for (int r = 0; r < c_.world; ++r) wake(r, q_.now());
+    }
+
+    SimResult finish(std::uint64_t events) {
         SimResult out;
         out.events = events;
         for (int r = 0; r < c_.world; ++r) {
@@ -121,7 +131,10 @@ public:
     }
 
     double& host_clock(int rank) override { return ranks_[rank].clock; }
-    bool gpu_busy(int rank, double t) const override { return ranks_[rank].gpu_free > t; }
+    bool gpu_busy(int rank, double t) const override {
+        const Rank& k = ranks_[rank];
+        return k.gpu_free > t || !k.gpu_queue.empty();
+    }
     void note_activity(int rank) override { ++ranks_[rank].activity; }
 
     void wake(int rank, double at) override {
@@ -137,6 +150,11 @@ public:
     }
 
 private:
+    struct GpuJob {
+        int op;
+        double dur;     // before interference
+        double issued;  // host time of the issue
+    };
     struct Rank {
         ep::EpShape shape;
         SimRankResult result;
@@ -149,7 +167,15 @@ private:
         std::vector<int> stream_ops;     // issued, in order
         std::size_t stream_polled = 0;
         std::vector<std::uint64_t> send_counts, recv_counts;  // counts exchange stand-ins
-        double clock = 0, busy_until = 0, gpu_free = 0;
+        double clock = 0, busy_until = 0;
+        std::deque<GpuJob> gpu_queue;  // issued, not started
+        bool gpu_running = false;      // an op is started (or about to start)
+        GpuJob gpu_current{};          // the running op
+        bool gpu_in_op = false;
+        double gpu_current_start = 0;
+        double gpu_left = 0, gpu_last = 0, gpu_rate = 1;  // left: work at rate 1, as of gpu_last
+        std::uint64_t gpu_end_token = 0;
+        double gpu_free = 0;  // (expected) end of the last started op
         bool wake_pending = false;
         double wake_at = 0;
         std::uint64_t wake_token = 0;
@@ -212,6 +238,7 @@ private:
             if (k.activity == before || k.done[prog.retire]) break;
         }
         k.busy_until = k.clock;
+        if (k.done[prog.retire] && ++retired_ == c_.world && on_done_) on_done_();
     }
 
     void observe(Rank& k, int op, Condition cond) {
@@ -296,42 +323,103 @@ private:
         return exec::compute_work(k.result.program, op, k.result.plan, tokens_[k.shape.rank]);
     }
 
-    // Enqueues GPU work on rank r's stream at the current host time. It runs
-    // slower while the rank's copy engines move remote chunks.
+    // Enqueues GPU work on rank r's stream at the current host time. The
+    // stream runs its ops in issue order; an op issued to an idle stream
+    // starts after the launch latency.
     void gpu(int r, int op, double dur) {
         Rank& k = ranks_[r];
-        dur *= c_.compute_scale;
-        const double start = k.gpu_free <= k.clock ? k.clock + launch_latency_ : k.gpu_free;
-        dur *= 1.0 + (gpu_copy_slowdown_ - 1.0) * fabric_->remote_engines_busy(r, start) / 2.0;
-        k.gpu_free = start + dur;
-        k.result.gpu_busy += dur;
-        k.result.ops[op].gpu_start = start;
-        k.result.ops[op].gpu_end = k.gpu_free;
         k.stream_ops.push_back(op);
-        const double end = k.gpu_free;
-        q_.schedule_at(end, [this, r, op, end] {
-            ranks_[r].gpu_finished[op] = 1;
+        k.gpu_queue.push_back({op, dur * c_.compute_scale, k.clock});
+        if (!k.gpu_running) gpu_start_next(r, k.clock + launch_latency_);
+    }
+
+    // Starts the next queued op of rank r's stream at time t. It runs at
+    // 1 / (1 + (gpu_copy_slowdown - 1) * k / 2) while k of the rank's copy
+    // engines move remote chunks, so its end moves whenever k changes
+    // (remote_busy_changed).
+    void gpu_start_next(int r, double t) {
+        Rank& k = ranks_[r];
+        k.gpu_running = true;
+        q_.schedule_at(t, [this, r, t] {
+            Rank& k = ranks_[r];
+            if (k.gpu_queue.empty()) return;
+            k.gpu_current = k.gpu_queue.front();
+            k.gpu_queue.pop_front();
+            k.gpu_current_start = t;
+            k.gpu_left = k.gpu_current.dur;
+            k.gpu_last = t;
+            k.gpu_in_op = true;
+            k.result.ops[k.gpu_current.op].gpu_start = t;
+            schedule_gpu_end(r, t);
+        });
+    }
+
+    double gpu_rate(int r) const {
+        return 1.0 / (1.0 + (gpu_copy_slowdown_[r] - 1.0) * fabric_->remote_busy(r) / 2.0);
+    }
+
+    // Brings the running op up to time t at its old rate, then schedules its
+    // end at the current rate.
+    void schedule_gpu_end(int r, double t) {
+        Rank& k = ranks_[r];
+        k.gpu_left = std::max(0.0, k.gpu_left - (t - k.gpu_last) * k.gpu_rate);
+        k.gpu_last = t;
+        k.gpu_rate = gpu_rate(r);
+        const double end = t + k.gpu_left / k.gpu_rate;
+        k.gpu_free = end;
+        const std::uint64_t token = ++k.gpu_end_token;
+        q_.schedule_at(end, [this, r, end, token] {
+            Rank& k = ranks_[r];
+            if (k.gpu_end_token != token) return;  // superseded by a later estimate
+            k.gpu_in_op = false;
+            const int op = k.gpu_current.op;
+            k.result.gpu_busy += end - k.gpu_current_start;
+            k.result.ops[op].gpu_end = end;
+            k.gpu_finished[op] = 1;
+            k.gpu_running = false;
+            if (!k.gpu_queue.empty()) gpu_start_next(r, std::max(end, k.gpu_queue.front().issued + launch_latency_));
             wake(r, end);
         });
+    }
+
+    void remote_busy_changed(int rank, double t) override {
+        if (ranks_.empty()) return;
+        if (ranks_[rank].gpu_in_op) schedule_gpu_end(rank, t);
     }
 
     const SimLayerConfig& c_;
     const std::vector<std::vector<std::int64_t>>& counts_;
     const std::vector<int>& tokens_;
     const CostProfile& p_;
-    double host_poll_ = 0, launch_latency_ = 0, gpu_copy_slowdown_ = 1.0;
-    EventQueue q_;
-    std::unique_ptr<SimFabric> fabric_;
+    double host_poll_ = 0, launch_latency_ = 0;
+    std::vector<double> gpu_copy_slowdown_;  // per rank
+    Scheduler& q_;
+    std::function<void()> on_done_;
+    int retired_ = 0;
+    std::unique_ptr<Fabric> fabric_;
     std::vector<Rank> ranks_;
 };
 
-}  // namespace
+LayerSimulation::LayerSimulation(const SimLayerConfig& config, const std::vector<std::vector<std::int64_t>>& counts,
+                                 const std::vector<int>& tokens, const CostProfile& profile, Scheduler& scheduler,
+                                 const FabricFactory& fabric) {
+    planner::validate_group_plan(config.groups, config.num_experts);
+    impl_ = std::make_unique<Impl>(config, counts, tokens, profile, scheduler, fabric);
+}
+
+LayerSimulation::~LayerSimulation() = default;
+
+void LayerSimulation::start(std::function<void()> on_all_retired) { impl_->start(std::move(on_all_retired)); }
+
+SimResult LayerSimulation::finish(std::uint64_t events) { return impl_->finish(events); }
 
 SimResult simulate_layer(const SimLayerConfig& config, const std::vector<std::vector<std::int64_t>>& counts,
                          const std::vector<int>& tokens, const CostProfile& profile) {
-    planner::validate_group_plan(config.groups, config.num_experts);
-    Simulation sim(config, counts, tokens, profile);
-    return sim.run();
+    EventQueue q;
+    LayerSimulation sim(config, counts, tokens, profile, q);
+    sim.start();
+    const std::uint64_t events = q.run();
+    return sim.finish(events);
 }
 
 }  // namespace nano_nccl::sim

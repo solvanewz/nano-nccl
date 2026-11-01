@@ -11,15 +11,20 @@
 // timing checks: a slower network delays the experts, combines start only
 // after their experts, smaller buffers cause waiting, no overlap gives
 // strictly serial steps, overlap beats serial when both sides cost the same,
-// and runs are deterministic.
+// and runs are deterministic. Plus the in-situ copy model on its own: two
+// remote copies on one GPU slow each other by the profile's factor, and the
+// survivor speeds up again when the other ends (exact times); per-rank GPU
+// slowdowns apply to their rank only.
 #include "cost_profile.h"
 #include "exec/exec_program.h"
 #include "exec/exec_trace.h"
 #include "planner/group_plan.h"
 #include "sim_layer.h"
+#include "sim_wire.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <exception>
 #include <numeric>
@@ -35,6 +40,11 @@ using nano_nccl::exec::LayerProgram;
 using nano_nccl::exec::OpKind;
 using nano_nccl::exec::Queue;
 using nano_nccl::sim::CostProfile;
+using nano_nccl::sim::EventQueue;
+using nano_nccl::sim::HostModel;
+using nano_nccl::sim::SimFabric;
+using nano_nccl::sim::WireCosts;
+using nano_nccl::transport::peer::ChunkHeader;
 using nano_nccl::sim::SimLayerConfig;
 using nano_nccl::sim::SimResult;
 using nano_nccl::sim::Table;
@@ -440,6 +450,87 @@ void test_timing() {
     require(rsw.makespan > r0.makespan + 50, "switch stalls had no effect");
 }
 
+// In-situ copy model, driven directly through the fabric: rank 1 sends rank 0
+// one 1 MiB chunk; then rank 0 copies it out (rx) while it sends `tx_bytes`
+// to rank 1 (tx). Remote copies cost 50 us/MiB alone and 100 us/MiB while
+// the same GPU's other engine moves a remote chunk. Returns rank 0's
+// {tx, rx} engine busy time for the overlapped pair.
+std::pair<double, double> fluid_pair(std::size_t tx_bytes, int* gpu_changes) {
+    struct Host final : HostModel {
+        double clk[2] = {0, 0};
+        int changes = 0;
+        double& host_clock(int r) override { return clk[r]; }
+        void wake(int, double) override {}
+        void note_activity(int) override {}
+        bool gpu_busy(int, double) const override { return false; }
+        void remote_busy_changed(int rank, double) override { changes += rank == 0 ? 1 : 0; }
+    } host;
+    constexpr double kMiB = 1 << 20;
+    WireCosts c;
+    c.tx_remote = c.rx_remote = Table({{0, 0}, {kMiB, 80}});  // only its shape is used: linear
+    c.tx_self = c.rx_self = Table({{0, 0}, {kMiB, 4}});
+    c.tx_insitu = c.rx_insitu = Table({{0, 50}, {1, 100}});
+    c.contention = c.insitu = true;
+    EventQueue q;
+    SimFabric f(q, host, 2, 4, 1 << 20, {c, c});
+    auto header = [](int src, int dst, std::size_t bytes) {
+        ChunkHeader h;
+        h.src = static_cast<std::uint32_t>(src);
+        h.dst = static_cast<std::uint32_t>(dst);
+        h.chunk_count = 1;
+        h.bytes = h.total_bytes = bytes;
+        return h;
+    };
+    f.wire(1).write_chunk(0, 0, header(1, 0, 1 << 20), nullptr);
+    q.run();
+    require(std::fabs(f.tx(1).busy - 50) < 1e-9, "a lone remote copy must cost its alone time");
+    host.clk[1] = q.now();
+    f.wire(1).progress();  // publishes the arrival
+    q.run();
+    require(f.wire(0).arrived(1) == 1, "chunk did not arrive");
+    host.clk[0] = q.now();
+    const int before = host.changes;
+    f.wire(0).copy_out(1, 0, nullptr, 1 << 20);
+    f.wire(0).write_chunk(1, 0, header(0, 1, tx_bytes), nullptr);
+    q.run();
+    *gpu_changes = host.changes - before;
+    return {f.tx(0).busy, f.rx(0).busy};
+}
+
+void test_fluid() {
+    int changes = 0;
+    // Both 1 MiB: each runs at half speed for all of it.
+    auto [tx1, rx1] = fluid_pair(1 << 20, &changes);
+    require(std::fabs(tx1 - 100) < 1e-6 && std::fabs(rx1 - 100) < 1e-6,
+            "overlapped copies: tx " + std::to_string(tx1) + " rx " + std::to_string(rx1) + " us, want 100 and 100");
+    require(changes >= 2, "GPU was not told about remote copies starting and ending");
+    // tx 0.5 MiB: both at half speed until tx ends at +50 (25 us of work),
+    // then rx runs its remaining 25 us of work at full speed: ends at +75.
+    auto [tx2, rx2] = fluid_pair(1 << 19, &changes);
+    require(std::fabs(tx2 - 50) < 1e-6 && std::fabs(rx2 - 75) < 1e-6,
+            "rx did not speed up after tx ended: tx " + std::to_string(tx2) + " rx " + std::to_string(rx2) +
+                " us, want 50 and 75");
+
+    // Per-rank GPU slowdown: only rank 0's GPU work gets slower.
+    CostProfile p = synthetic_profile(true);
+    p.tables[cost::kTxRemoteInsitu] = Table({{0, 45}, {1, 90}});
+    p.tables[cost::kRxRemoteInsitu] = Table({{0, 45}, {1, 90}});
+    p.scalars[std::string(cost::kGpuCopySlowdown) + "@0"] = 3.0;
+    p.scalars[std::string(cost::kGpuCopySlowdown) + "@1"] = 1.0;
+    CostProfile quiet = p;
+    quiet.scalars[std::string(cost::kGpuCopySlowdown) + "@0"] = 1.0;
+    Case c = balanced_case(2, 4, 512, 512);
+    c.config.groups = nano_nccl::planner::fixed_group_plan(2, 8, 4);
+    c.config.options = {true, 3};
+    const SimResult slow = run(c, p), base = run(c, quiet);
+    check_invariants(c, slow, p);
+    require(std::fabs(slow.ranks[1].gpu_busy - base.ranks[1].gpu_busy) < 1e-6, "rank 1 GPU work changed");
+    require(slow.ranks[0].gpu_busy > base.ranks[0].gpu_busy * 1.05, "rank 0 GPU slowdown had no effect");
+    require(slow.ranks[0].gpu_busy <= base.ranks[0].gpu_busy * 3.0 + 1e-6, "GPU slowed beyond its factor");
+    std::printf("  in-situ GPU busy rank 0 %.0f us (quiet %.0f), rank 1 %.0f us\n", slow.ranks[0].gpu_busy,
+                base.ranks[0].gpu_busy, slow.ranks[1].gpu_busy);
+}
+
 }  // namespace
 
 int main() {
@@ -447,6 +538,7 @@ int main() {
     check("formats", test_formats);
     check("random_worlds_invariants", [] { test_random(400); });
     check("timing_dependencies", test_timing);
+    check("insitu_copy_model", test_fluid);
     std::printf("sim_adapter=%s\n", g_failed == 0 ? "PASS" : "FAIL");
     return g_failed == 0 ? 0 : 1;
 }
