@@ -210,6 +210,9 @@ NetFabric::NetFabric(Scheduler& scheduler, HostModel& host, int nranks, int slot
     headers_.assign(links, std::vector<ChunkHeader>(slots_per_link));
     arrived_.assign(links, 0);
     released_.assign(links, 0);
+    proxy_free_.assign(static_cast<std::size_t>(nranks), 0.0);
+    sent_by_.assign(static_cast<std::size_t>(nranks), 0);
+    if (config_.post_overhead < 0) throw std::invalid_argument("NetFabric: negative post overhead");
     delivered_.assign(links, {});
     in_order_.assign(links, 0);
     credits_sent_.assign(links, 0);
@@ -231,6 +234,11 @@ ChunkHeader& NetFabric::slot(int owner, int src, std::uint64_t seq) {
 
 void NetFabric::send(int src, int dst, int tag, std::uint64_t bytes, double at, std::function<void()> on_sent,
                      std::function<void()> on_received) {
+    ++sent_by_[src];
+    if (config_.post_overhead > 0) {
+        at = std::max(at, proxy_free_[src]) + config_.post_overhead;
+        proxy_free_[src] = at;
+    }
     sched_.schedule_at(at, [this, src, dst, tag, bytes, on_sent = std::move(on_sent),
                             on_received = std::move(on_received)]() mutable {
         AstraSim::sim_request req{};

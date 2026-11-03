@@ -59,6 +59,11 @@ struct NetConfig {
     std::size_t header_bytes = sizeof(transport::peer::ChunkHeader);  // sent with every chunk
     std::size_t credit_bytes = 64;
     double arrival_latency = 0;  // receiver sees the arrival this long after delivery (us)
+    // Unknown RDMA-side cost, swept as a range (plan rule): every network
+    // message (chunk or credit) passes the sending rank's proxy, which hands
+    // messages to the NIC one at a time, this many us each (work request
+    // build, doorbell). 0: messages go to the network at their issue time.
+    double post_overhead = 0;
     bool host_staged = false;    // RdmaWire semantics (see above), else GPUDirect write
 };
 
@@ -82,6 +87,10 @@ public:
     std::uint64_t messages_sent() const { return sent_; }
     std::uint64_t sends_completed() const { return send_done_; }
     std::uint64_t receives_completed() const { return recv_done_; }
+    // Network messages rank `rank` sent, and when its proxy handed the last
+    // one to the NIC (NetConfig::post_overhead > 0; else 0).
+    std::uint64_t messages_sent_by(int rank) const { return sent_by_[rank]; }
+    double proxy_busy_until(int rank) const { return proxy_free_[rank]; }
 
 private:
     class Wire;
@@ -113,6 +122,8 @@ private:
     std::vector<std::uint64_t> credits_sent_;                         // [src * n + dst]: credit messages dst -> src
     std::vector<std::set<std::uint64_t>> send_done_set_;              // [src * n + dst], not yet in order
     std::vector<std::uint64_t> acked_;                                // [src * n + dst], sends completed in order
+    std::vector<double> proxy_free_;                                  // [rank]: proxy busy until (post_overhead)
+    std::vector<std::uint64_t> sent_by_;                              // [rank]: network messages sent
     std::vector<LinkStats> links_;
     std::vector<EngineStats> tx_stats_, rx_stats_;
     std::uint64_t sent_ = 0, send_done_ = 0, recv_done_ = 0;

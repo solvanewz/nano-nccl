@@ -108,6 +108,7 @@ struct Args {
     double skew = 0.0;
     std::string scheduler = "fixed";
     std::string workload = "zipf";
+    unsigned long long seed = 0;
     bool from_counts = false;
     int groups = 1, lookahead = 1;
     bool overlap = true, sweep = false, timeline = false;
@@ -189,7 +190,8 @@ double synthetic(const Args& a, const nano_nccl::sim::CostProfile& profile, int 
     c.mode = a.mode;
     std::vector<int> tokens(a.world, a.tokens);
     const auto counts = nano_nccl::ep::workload_counts(nano_nccl::ep::parse_workload(a.workload, a.skew),
-                                                       {a.world, 0, a.experts, a.top_k, a.hidden, a.ffn}, a.tokens);
+                                                       {a.world, 0, a.experts, a.top_k, a.hidden, a.ffn}, a.tokens,
+                                                       a.seed);
     c.plan = nano_nccl::exec::plan_source_for(nano_nccl::planner::parse_scheduler(a.scheduler), a.world, a.experts,
                                               groups, a.from_counts);
     c.options = {overlap, lookahead};
@@ -245,6 +247,7 @@ int main(int argc, char** argv) {
             else if (arg == "--skew") a.skew = std::atof(next());
             else if (arg == "--scheduler") a.scheduler = next();
             else if (arg == "--workload") a.workload = next();
+            else if (arg == "--seed") a.seed = std::strtoull(next(), nullptr, 0);
             else if (arg == "--plan-from-counts") a.from_counts = true;
             else if (arg == "--groups") a.groups = std::atoi(next());
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());

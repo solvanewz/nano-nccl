@@ -55,13 +55,19 @@ Workload parse_workload(const std::string& name, double skew);  // throws std::i
 std::vector<double> source_expert_weights(const Workload& workload, const EpShape& shape);
 
 // counts[r][e] = N(r, e) when every rank r routes `tokens` tokens of
-// `workload` with benchmark_routing_seed(r) (shape.rank is ignored).
-std::vector<std::vector<std::int64_t>> workload_counts(const Workload& workload, const EpShape& shape, int tokens);
+// `workload` with routing_seed(r, seed) (shape.rank is ignored).
+std::vector<std::vector<std::int64_t>> workload_counts(const Workload& workload, const EpShape& shape, int tokens,
+                                                       std::uint64_t seed = 0);
 
 // counts[e] = number of entries routed to expert e.
 std::vector<std::int64_t> expert_counts(const std::vector<std::int32_t>& ids, int num_experts);
 
 // Seed of rank r's routing in the benchmark runs (tests/ep_moe_test --ffn).
 inline std::uint64_t benchmark_routing_seed(int rank) { return 4242 + static_cast<std::uint64_t>(rank); }
+// Rank r's routing seed for sample `seed` of a workload; seed 0 is the
+// benchmark seed.
+inline std::uint64_t routing_seed(int rank, std::uint64_t seed) {
+    return benchmark_routing_seed(rank) + seed * 1000003ull;
+}
 
 }  // namespace nano_nccl::ep

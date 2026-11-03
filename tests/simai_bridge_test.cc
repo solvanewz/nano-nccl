@@ -126,6 +126,8 @@ void test_callbacks() {
 struct Run {
     SimResult res;
     std::uint64_t sent = 0, send_done = 0, recv_done = 0;
+    std::vector<std::uint64_t> sent_by;
+    std::vector<double> proxy_busy_until;
 };
 
 Run run_layer(const SimLayerConfig& c, const std::vector<std::vector<std::int64_t>>& counts,
@@ -152,6 +154,10 @@ Run run_layer(const SimLayerConfig& c, const std::vector<std::vector<std::int64_
     r.sent = fabric->messages_sent();
     r.send_done = fabric->sends_completed();
     r.recv_done = fabric->receives_completed();
+    for (int k = 0; k < c.world; ++k) {
+        r.sent_by.push_back(fabric->messages_sent_by(k));
+        r.proxy_busy_until.push_back(fabric->proxy_busy_until(k));
+    }
     return r;
 }
 
@@ -277,6 +283,43 @@ void test_timing() {
                 slow.res.makespan, static_cast<unsigned long long>(fast.sent));
 }
 
+// NetConfig::post_overhead: each rank's proxy hands one message at a time to
+// the NIC, so a rank that sends n messages needs at least n * overhead.
+void test_post_overhead() {
+    const CostProfile p = profile();
+    SimLayerConfig c;
+    c.world = 4;
+    c.num_experts = 16;
+    c.top_k = 2;
+    c.hidden = 1024;
+    c.ffn = 512;
+    c.plan = nano_nccl::exec::PlanSource::ahead(nano_nccl::planner::fixed_group_plan(4, 16, 4));
+    c.options = {true, 1};
+    c.slots_per_link = 4;
+    c.slot_bytes = 65536;
+    std::vector<std::vector<std::int64_t>> counts(4, std::vector<std::int64_t>(16, 256));
+    std::vector<int> tokens(4, 256 * 16 / 2);
+    const Run base = run_layer(c, counts, tokens, p, 200, 1);
+    NetConfig zero;
+    zero.post_overhead = 0;
+    require(run_layer(c, counts, tokens, p, 200, 1, zero).res.makespan == base.res.makespan,
+            "zero overhead changes the run");
+    NetConfig slow;
+    slow.post_overhead = 20;
+    const Run r = run_layer(c, counts, tokens, p, 200, 1, slow);
+    check_run(c, r, 200, 1);
+    // Serialized: the n-th message leaves the proxy no earlier than n
+    // overheads (some trailing credits go out after the layer retired, so
+    // the makespan itself is not bounded by it).
+    for (int k = 0; k < c.world; ++k) {
+        require(r.proxy_busy_until[k] >= static_cast<double>(r.sent_by[k]) * slow.post_overhead - 1e-6,
+                "proxy of rank " + std::to_string(k) + " does not serialize its messages");
+    }
+    require(r.res.makespan > base.res.makespan, "overhead did not slow the layer");
+    std::printf("  post overhead 0: %.0f us, 20 us/message: %.0f us (%llu messages from rank 0)\n",
+                base.res.makespan, r.res.makespan, static_cast<unsigned long long>(r.sent_by[0]));
+}
+
 // One slot per link and a long latency: a message of n chunks needs at least
 // n data latencies and n - 1 credit latencies.
 void test_credits() {
@@ -368,6 +411,7 @@ int main() {
     check("random_worlds", [] { test_random(200); });
     check("timing", test_timing);
     check("credit_round_trips", test_credits);
+    check("post_overhead", test_post_overhead);
     check("staged_vs_gpudirect", test_staged);
     std::printf("simai_bridge=%s\n", g_failed == 0 ? "PASS" : "FAIL");
     return g_failed == 0 ? 0 : 1;

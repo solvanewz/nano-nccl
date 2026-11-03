@@ -12,7 +12,8 @@
 //       completed (the minimal send -> completion callback case).
 //   nano_ep_ns3 --profile P [--trace T | synthetic options as nano_ep_sim]
 //               [--world W --gbps G --latency-us L --out DIR]
-//               [--backend ns3|analytical] [--staged]
+//               [--backend ns3|analytical] [--staged] [--seed S]
+//               [--compute-scale X --copy-scale X --post-overhead-us U --arrival-latency-us U]
 //       one layer invocation; host and GPU costs from the profile, network
 //       from ns-3. The topology is a star: W GPU nodes on one switch, links of
 //       G Gb/s and L us; the ns-3 inputs and outputs go to DIR. With
@@ -202,6 +203,10 @@ struct Args {
     double latency_us = 1.0;
     bool staged = false;  // host-staged sends (RdmaWire semantics), else GPUDirect writes
     double max_sim_ms = 1000;  // ns-3: stop (and report a deadlock) after this much simulated time
+    // Sensitivity knobs (plan: unknown RDMA costs are swept as ranges).
+    double compute_scale = 1.0, copy_scale = 1.0;  // GPU op and local copy durations
+    double post_overhead_us = 0, arrival_latency_us = 0;  // NetConfig
+    unsigned long long seed = 0;                           // routing sample (ep::routing_seed)
 };
 
 // SimAI's example ns-3 configuration (inputs/config/SimAI.conf) with the
@@ -317,8 +322,24 @@ int run(const Args& a) {
 
     nsim::simai::NetFabric* fabric = nullptr;
     const double limit_ms = a.max_sim_ms;
+    // After the last retire, messages still queued (e.g. trailing credits
+    // behind a proxy's post overhead) are drained before stopping; the
+    // makespan is fixed at the retires.
+    struct Drain {
+        nsim::simai::NetFabric** fabric;
+        static void check(void* p) {
+            auto* d = static_cast<Drain*>(p);
+            if ((*d->fabric)->receives_completed() >= (*d->fabric)->messages_sent()) {
+                Simulator::Stop();
+                return;
+            }
+            Simulator::Schedule(MicroSeconds(10), &Drain::check, p);
+        }
+    };
+    static Drain drain;
+    drain.fabric = &fabric;
     const nsim::SimResult res = run_layer(a, sched, eps, [limit_ms](nsim::LayerSimulation& sim) {
-        sim.start([] { Simulator::Stop(); });
+        sim.start([] { Drain::check(&drain); });
         // DCQCN timers keep the event loop alive forever, so a message that
         // never completes would hang the run; stop and let finish() report
         // where the layer stopped.
@@ -365,7 +386,7 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
         c.slot_bytes = a.slot_bytes;
         tokens.assign(a.world, a.tokens);
         counts = nano_nccl::ep::workload_counts(nano_nccl::ep::parse_workload(a.workload, a.skew),
-                                                {a.world, 0, a.experts, a.top_k, a.hidden, a.ffn}, a.tokens);
+                                                {a.world, 0, a.experts, a.top_k, a.hidden, a.ffn}, a.tokens, a.seed);
         c.plan = nano_nccl::exec::plan_source_for(nano_nccl::planner::parse_scheduler(a.scheduler), a.world,
                                                   a.experts, a.groups, a.from_counts);
     }
@@ -373,11 +394,15 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
                        std::vector<nsim::WireCosts> costs) -> std::unique_ptr<nsim::Fabric> {
         nsim::simai::NetConfig config;
         config.host_staged = a.staged;
+        config.post_overhead = a.post_overhead_us;
+        config.arrival_latency = a.arrival_latency_us;
         auto f = std::make_unique<nsim::simai::NetFabric>(s, host, world, slots, slot_bytes, std::move(costs), eps,
                                                           config);
         *fabric_out = f.get();
         return f;
     };
+    c.compute_scale = a.compute_scale;
+    c.copy_scale = a.copy_scale;
     nsim::LayerSimulation sim(c, counts, tokens, profile, sched, factory);
     drive(sim);
     return sim.finish();
@@ -442,6 +467,11 @@ int main(int argc, char** argv) {
             else if (arg == "--backend") a.backend = next();
             else if (arg == "--staged") a.staged = true;
             else if (arg == "--max-sim-ms") a.max_sim_ms = std::atof(next());
+            else if (arg == "--compute-scale") a.compute_scale = std::atof(next());
+            else if (arg == "--copy-scale") a.copy_scale = std::atof(next());
+            else if (arg == "--post-overhead-us") a.post_overhead_us = std::atof(next());
+            else if (arg == "--arrival-latency-us") a.arrival_latency_us = std::atof(next());
+            else if (arg == "--seed") a.seed = std::strtoull(next(), nullptr, 0);
             else throw std::invalid_argument("unknown option " + arg);
         }
         const int speeds[] = {25, 50, 100, 200, 400, 1600};  // ECN maps of SimAI.conf

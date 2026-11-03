@@ -123,13 +123,14 @@ std::vector<double> source_expert_weights(const Workload& w, const EpShape& s) {
     return out;
 }
 
-std::vector<std::vector<std::int64_t>> workload_counts(const Workload& workload, const EpShape& shape, int tokens) {
+std::vector<std::vector<std::int64_t>> workload_counts(const Workload& workload, const EpShape& shape, int tokens,
+                                                       std::uint64_t seed) {
     std::vector<std::vector<std::int64_t>> counts;
     for (int r = 0; r < shape.world; ++r) {
         EpShape s = shape;
         s.rank = r;
         counts.push_back(expert_counts(
-            make_routing(s, tokens, source_expert_weights(workload, s), benchmark_routing_seed(r)).ids,
+            make_routing(s, tokens, source_expert_weights(workload, s), routing_seed(r, seed)).ids,
             shape.num_experts));
     }
     return counts;
