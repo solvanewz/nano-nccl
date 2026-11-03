@@ -5,9 +5,11 @@
 // Checks that both ends of every message agree on its size, that every row
 // reaches its expert exactly once and in a deterministic order, that every
 // layout passes the exchanger's validation, and that every row returns to the
-// position it was sent from.
+// position it was sent from. Also checks the scheduler switch
+// (src/planner/scheduler) and its random test plans.
 #include "ep/ep_plan.h"
 #include "planner/group_plan.h"
+#include "planner/scheduler.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -51,6 +53,7 @@ void copy_rows(const std::vector<Tag>& src, std::size_t src_off, std::vector<Tag
 }
 
 GroupPlan random_plan(std::mt19937_64& rng, int world, int experts) {
+    if (rng() % 3 == 0) return nano_nccl::planner::random_group_plan(experts, experts + 1, rng());
     if (rng() % 2 == 0) {
         const int per_rank = experts / world;
         return nano_nccl::planner::fixed_group_plan(world, experts, 1 + static_cast<int>(rng() % per_rank));
@@ -180,6 +183,65 @@ void run_trial(std::mt19937_64& rng, int trial) {
     }
 }
 
+bool same_plan(const GroupPlan& a, const GroupPlan& b) {
+    return a.expert_group == b.expert_group && a.order == b.order;
+}
+
+// The scheduler switch: names, the fixed scheduler, determinism, and that the
+// random test plans reach the shapes a dynamic scheduler may produce.
+bool test_scheduler() {
+    namespace pl = nano_nccl::planner;
+    bool ok = true;
+    auto check = [&ok](bool cond, const std::string& what) {
+        if (!cond) {
+            std::printf("FAIL scheduler: %s\n", what.c_str());
+            ok = false;
+        }
+    };
+    for (pl::SchedulerKind k : {pl::SchedulerKind::kFixed}) {
+        check(pl::parse_scheduler(pl::scheduler_name(k)) == k, std::string("name round trip ") + pl::scheduler_name(k));
+    }
+    for (int W : {1, 2, 4, 8}) {
+        for (int epr : {1, 2, 8}) {
+            for (int g = 1; g <= epr; ++g) {
+                const pl::ScheduleRequest req{W, W * epr, g, {}};
+                check(same_plan(pl::make_schedule(pl::SchedulerKind::kFixed, req), pl::fixed_group_plan(W, W * epr, g)),
+                      "fixed scheduler differs from fixed_group_plan");
+                pl::ScheduleRequest with_counts = req;
+                with_counts.counts.assign(static_cast<std::size_t>(W) * W * epr, 3);
+                check(same_plan(pl::make_schedule(pl::SchedulerKind::kFixed, with_counts), pl::fixed_group_plan(W, W * epr, g)),
+                      "fixed scheduler depends on the counts");
+            }
+        }
+    }
+    // Random test plans: deterministic, valid, and covering empty groups,
+    // groups with one rank's experts only, and groups spanning every rank.
+    const int W = 2, E = 8, epr = E / W;
+    int empty = 0, one_rank = 0, all_ranks = 0, reordered = 0;
+    for (std::uint64_t seed = 0; seed < 400; ++seed) {
+        const GroupPlan a = pl::random_group_plan(E, E + 1, seed);
+        check(same_plan(a, pl::random_group_plan(E, E + 1, seed)), "random plan not deterministic");
+        check(a.groups() >= 1 && a.groups() <= E + 1, "random plan group count");
+        for (int g = 0; g < a.groups(); ++g) {
+            int ranks = 0;
+            for (int r = 0; r < W; ++r) {
+                bool has = false;
+                for (int j = 0; j < epr; ++j) has |= a.expert_group[r * epr + j] == g;
+                ranks += has ? 1 : 0;
+            }
+            empty += ranks == 0;
+            one_rank += ranks == 1;
+            all_ranks += ranks == W;
+        }
+        for (int i = 0; i < a.groups(); ++i) reordered += a.order[i] != i;
+    }
+    check(empty > 0 && one_rank > 0 && all_ranks > 0 && reordered > 0,
+          "random plans miss a shape: empty " + std::to_string(empty) + ", one rank " + std::to_string(one_rank) +
+              ", all ranks " + std::to_string(all_ranks) + ", reordered " + std::to_string(reordered));
+    if (ok) std::printf("PASS scheduler\n");
+    return ok;
+}
+
 template <typename Fn>
 bool expect_invalid(const char* name, Fn fn) {
     try {
@@ -207,6 +269,7 @@ int main() {
     }
     std::printf("trials: %d passed, %d failed\n", kTrials - failed, failed);
     bool ok = failed == 0;
+    ok &= test_scheduler();
     ok &= expect_invalid("group_out_of_range", [] {
         nano_nccl::planner::validate_group_plan({{0, 2}, {0, 1}}, 2);
     });
@@ -217,6 +280,17 @@ int main() {
         nano_nccl::planner::validate_group_plan({{0}, {0}}, 2);
     });
     ok &= expect_invalid("fixed_too_many_groups", [] { nano_nccl::planner::fixed_group_plan(2, 4, 3); });
+    ok &= expect_invalid("unknown_scheduler", [] { nano_nccl::planner::parse_scheduler("greedy"); });
+    ok &= expect_invalid("schedule_counts_size", [] {
+        nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kFixed, {2, 4, 2, {1, 2, 3}});
+    });
+    ok &= expect_invalid("schedule_negative_count", [] {
+        nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kFixed,
+                                          {2, 4, 2, {1, 2, 3, 4, 5, 6, 7, -1}});
+    });
+    ok &= expect_invalid("schedule_bad_world", [] {
+        nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kFixed, {3, 4, 1, {}});
+    });
     std::printf("ep_plan=%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

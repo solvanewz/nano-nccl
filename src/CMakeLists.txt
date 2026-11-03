@@ -47,8 +47,9 @@ set_target_properties(nano_nccl_peer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(nano_nccl_peer PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(nano_nccl_peer PRIVATE -O2 -Wall -Wextra)
 
-# Expert grouping plans, shared by the runtime and the simulator; pure C++.
-add_library(nano_nccl_planner STATIC planner/group_plan.cc)
+# Expert grouping plans and the scheduler switch, shared by the runtime and
+# the simulator; pure C++.
+add_library(nano_nccl_planner STATIC planner/group_plan.cc planner/scheduler.cc)
 set_target_properties(nano_nccl_planner PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(nano_nccl_planner PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_compile_options(nano_nccl_planner PRIVATE -O2 -Wall -Wextra)

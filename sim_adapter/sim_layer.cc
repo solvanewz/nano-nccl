@@ -413,6 +413,22 @@ void LayerSimulation::start(std::function<void()> on_all_retired) { impl_->start
 
 SimResult LayerSimulation::finish(std::uint64_t events) { return impl_->finish(events); }
 
+planner::GroupPlan schedule_groups(planner::SchedulerKind kind, int world, int num_experts, int groups,
+                                   const std::vector<std::vector<std::int64_t>>& counts) {
+    planner::ScheduleRequest request{world, num_experts, groups, {}};
+    if (static_cast<int>(counts.size()) != world) {
+        throw std::invalid_argument("schedule_groups: counts has " + std::to_string(counts.size()) + " ranks");
+    }
+    for (const auto& row : counts) {
+        if (static_cast<int>(row.size()) != num_experts) {
+            throw std::invalid_argument("schedule_groups: a counts row has " + std::to_string(row.size()) +
+                                        " experts");
+        }
+        request.counts.insert(request.counts.end(), row.begin(), row.end());
+    }
+    return planner::make_schedule(kind, request);
+}
+
 SimResult simulate_layer(const SimLayerConfig& config, const std::vector<std::vector<std::int64_t>>& counts,
                          const std::vector<int>& tokens, const CostProfile& profile) {
     EventQueue q;

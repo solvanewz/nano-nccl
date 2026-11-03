@@ -6,10 +6,13 @@
 //       counts, group plan, options and slots; prints measured vs predicted
 //       stage times and, with --timeline, rank 0's per-op times.
 //   nano_ep_sim --profile P [--world W --experts E --topk K --hidden H --ffn-dim F
-//               --tokens T --skew S --groups G --lookahead L --no-overlap
-//               --slots N --slot-bytes B --mode ffn|probe --sweep --timeline]
+//               --tokens T --skew S --scheduler NAME --groups G --lookahead L
+//               --no-overlap --slots N --slot-bytes B --mode ffn|probe --sweep
+//               --timeline]
 //       synthetic routing (ep::make_routing with the benchmark seeds), one
-//       configuration or, with --sweep, the A40 benchmark sweep.
+//       configuration or, with --sweep, the A40 benchmark sweep. The group
+//       plan comes from the scheduler switch (planner::make_schedule, default
+//       fixed = B1) with G groups.
 #include "cost_profile.h"
 #include "ep/synthetic_routing.h"
 #include "exec/exec_trace.h"
@@ -101,6 +104,7 @@ struct Args {
     std::string profile, trace;
     int world = 2, experts = 16, top_k = 2, hidden = 2048, ffn = 1408, tokens = 4096;
     double skew = 0.0;
+    std::string scheduler = "fixed";
     int groups = 1, lookahead = 1;
     bool overlap = true, sweep = false, timeline = false;
     int slots = 4;
@@ -169,13 +173,6 @@ double synthetic(const Args& a, const nano_nccl::sim::CostProfile& profile, int 
     c.hidden = a.hidden;
     c.ffn = a.ffn;
     c.mode = a.mode;
-    c.groups = nano_nccl::planner::fixed_group_plan(a.world, a.experts, groups);
-    c.options = {overlap, lookahead};
-    c.slots_per_link = a.slots;
-    c.slot_bytes = a.slot_bytes;
-    c.copy_scale = a.copy_scale;
-    c.compute_scale = a.compute_scale;
-    c.contention = a.contention;
     std::vector<std::vector<std::int64_t>> counts;
     std::vector<int> tokens(a.world, a.tokens);
     for (int r = 0; r < a.world; ++r) {
@@ -184,15 +181,23 @@ double synthetic(const Args& a, const nano_nccl::sim::CostProfile& profile, int 
             nano_nccl::ep::make_routing(s, a.tokens, a.skew, -1, nano_nccl::ep::benchmark_routing_seed(r)).ids,
             a.experts));
     }
+    c.groups = nano_nccl::sim::schedule_groups(nano_nccl::planner::parse_scheduler(a.scheduler), a.world, a.experts,
+                                               groups, counts);
+    c.options = {overlap, lookahead};
+    c.slots_per_link = a.slots;
+    c.slot_bytes = a.slot_bytes;
+    c.copy_scale = a.copy_scale;
+    c.compute_scale = a.compute_scale;
+    c.contention = a.contention;
     const SimResult res = nano_nccl::sim::simulate_layer(c, counts, tokens, profile);
     std::vector<Stages> all;
     for (const auto& r : res.ranks) all.push_back(stages_of(r));
     const Stages s = slowest(all);
     if (verbose) {
-        std::printf("# simulated: world=%d experts=%d top_k=%d hidden=%d ffn=%d tokens=%d skew=%g groups=%d "
-                    "overlap=%d lookahead=%d slots=%d slot_bytes=%zu\n",
-                    a.world, a.experts, a.top_k, a.hidden, a.ffn, a.tokens, a.skew, groups, overlap ? 1 : 0,
-                    lookahead, a.slots, a.slot_bytes);
+        std::printf("# simulated: world=%d experts=%d top_k=%d hidden=%d ffn=%d tokens=%d skew=%g scheduler=%s "
+                    "groups=%d overlap=%d lookahead=%d slots=%d slot_bytes=%zu\n",
+                    a.world, a.experts, a.top_k, a.hidden, a.ffn, a.tokens, a.skew, a.scheduler.c_str(),
+                    c.groups.groups(), overlap ? 1 : 0, lookahead, a.slots, a.slot_bytes);
         std::printf("  route %.1f  counts %.1f  pipeline %.1f  reduce %.1f  total %.1f (us, slowest rank)\n", s.route,
                     s.counts, s.pipeline, s.reduce, s.total);
         print_utilization(res);
@@ -221,6 +226,7 @@ int main(int argc, char** argv) {
             else if (arg == "--ffn-dim") a.ffn = std::atoi(next());
             else if (arg == "--tokens") a.tokens = std::atoi(next());
             else if (arg == "--skew") a.skew = std::atof(next());
+            else if (arg == "--scheduler") a.scheduler = next();
             else if (arg == "--groups") a.groups = std::atoi(next());
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());
             else if (arg == "--no-overlap") a.overlap = false;

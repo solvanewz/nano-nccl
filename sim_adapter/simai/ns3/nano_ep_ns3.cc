@@ -171,6 +171,7 @@ struct Args {
     bool selftest = false;
     int world = 2, experts = 16, top_k = 2, hidden = 2048, ffn = 1408, tokens = 4096;
     double skew = 0.0;
+    std::string scheduler = "fixed";
     int groups = 1, lookahead = 1;
     bool overlap = true;
     int slots = 4;
@@ -332,7 +333,6 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
         c.hidden = a.hidden;
         c.ffn = a.ffn;
         c.mode = a.mode;
-        c.groups = nano_nccl::planner::fixed_group_plan(a.world, a.experts, a.groups);
         c.options = {a.overlap, a.lookahead};
         c.slots_per_link = a.slots;
         c.slot_bytes = a.slot_bytes;
@@ -343,6 +343,8 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
                 nano_nccl::ep::make_routing(s, a.tokens, a.skew, -1, nano_nccl::ep::benchmark_routing_seed(r)).ids,
                 a.experts));
         }
+        c.groups = nsim::schedule_groups(nano_nccl::planner::parse_scheduler(a.scheduler), a.world, a.experts,
+                                         a.groups, counts);
     }
     auto factory = [&](nsim::Scheduler& s, nsim::HostModel& host, int world, int slots, std::size_t slot_bytes,
                        std::vector<nsim::WireCosts> costs) -> std::unique_ptr<nsim::Fabric> {
@@ -399,6 +401,7 @@ int main(int argc, char** argv) {
             else if (arg == "--ffn-dim") a.ffn = std::atoi(next());
             else if (arg == "--tokens") a.tokens = std::atoi(next());
             else if (arg == "--skew") a.skew = std::atof(next());
+            else if (arg == "--scheduler") a.scheduler = next();
             else if (arg == "--groups") a.groups = std::atoi(next());
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());
             else if (arg == "--no-overlap") a.overlap = false;
