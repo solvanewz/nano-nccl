@@ -296,7 +296,7 @@ private:
             case OpKind::kPlan: {
                 k.clock += p_.table(cost::kHostPlan)(prog.steps);
                 if (prog.timing == exec::PlanTiming::kFromCounts) {
-                    k.clock += p_.table(std::string(cost::kHostSchedule) + planner::scheduler_name(c_.plan.scheduler))(
+                    k.clock += schedule_table(p_, planner::scheduler_name(c_.plan.scheduler), c_.world)(
                         static_cast<double>(c_.num_experts) * prog.steps);
                 }
                 const int epr = k.shape.experts_per_rank();
@@ -305,7 +305,7 @@ private:
                     for (int j = 0; j < epr; ++j) recv[s * epr + j] = counts_[s][r * epr + j];
                 }
                 // The scheduler itself: the same code the runtime's plan op runs.
-                const planner::GroupPlan groups = exec::resolve_plan(c_.plan, c_.world, c_.num_experts, global_counts_);
+                const planner::GroupPlan groups = exec::resolve_plan(c_.plan, c_.options, c_.world, c_.num_experts, global_counts_);
                 k.result.plan = exec::make_ep_plan(k.shape, groups, c_.options, counts_[r], recv, c_.slot_bytes,
                                                    prog.timing);
                 k.have_plan = true;

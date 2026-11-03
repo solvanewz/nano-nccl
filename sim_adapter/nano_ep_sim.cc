@@ -15,6 +15,10 @@
 //       plan comes from the scheduler switch (planner::make_schedule, default
 //       fixed = B1) with G groups (exec::plan_source_for: schedulers that read
 //       the counts, or any with --plan-from-counts, run at the plan op).
+//       cost_aware gets its cost model from the profile (fabric: the
+//       profile's host-staged copies; --fallback-permille N, --search-passes N
+//       override the model's defaults); ffn runs also print that model's
+//       estimate of the plan that ran ("cost_model estimate=... pipeline=...").
 #include "cost_profile.h"
 #include "ep/synthetic_routing.h"
 #include "exec/exec_trace.h"
@@ -24,6 +28,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -117,7 +122,26 @@ struct Args {
     std::string mode = "ffn";
     double copy_scale = 1.0, compute_scale = 1.0;
     bool contention = true;
+    int fallback_permille = -1, search_passes = -1;  // cost_aware model overrides (-1: model default)
 };
+
+// The planner's cost model on this profile (fabric: the profile's host-staged
+// copies), with the scales the simulation runs at.
+nano_nccl::planner::CostModel cost_model(const Args& a, const nano_nccl::sim::CostProfile& p, int hidden,
+                                         std::size_t slot_bytes) {
+    auto m = nano_nccl::sim::planner_cost_model(p, hidden, a.compute_scale,
+                                                nano_nccl::sim::copy_rates(p, slot_bytes));
+    if (a.fallback_permille >= 0) m.fallback_permille = a.fallback_permille;
+    if (a.search_passes >= 0) m.max_passes = a.search_passes;
+    return m;
+}
+
+void attach_cost_model(const Args& a, const nano_nccl::sim::CostProfile& p, SimLayerConfig& c) {
+    if (c.plan.timing == nano_nccl::exec::PlanTiming::kFromCounts &&
+        c.plan.scheduler == nano_nccl::planner::SchedulerKind::kCostAware) {
+        c.plan.cost = std::make_shared<const nano_nccl::planner::CostModel>(cost_model(a, p, c.hidden, c.slot_bytes));
+    }
+}
 
 int replay(const Args& a, const nano_nccl::sim::CostProfile& profile) {
     const auto trace = nano_nccl::exec::LayerTrace::load(a.trace);
@@ -140,6 +164,7 @@ int replay(const Args& a, const nano_nccl::sim::CostProfile& profile) {
     c.copy_scale = a.copy_scale;
     c.compute_scale = a.compute_scale;
     c.contention = a.contention;
+    attach_cost_model(a, profile, c);
     std::vector<std::vector<std::int64_t>> counts;
     std::vector<int> tokens;
     for (const auto& r : trace.ranks) {
@@ -200,6 +225,7 @@ double synthetic(const Args& a, const nano_nccl::sim::CostProfile& profile, int 
     c.copy_scale = a.copy_scale;
     c.compute_scale = a.compute_scale;
     c.contention = a.contention;
+    attach_cost_model(a, profile, c);
     const SimResult res = nano_nccl::sim::simulate_layer(c, counts, tokens, profile);
     std::vector<Stages> all;
     for (const auto& r : res.ranks) all.push_back(stages_of(r));
@@ -219,6 +245,14 @@ double synthetic(const Args& a, const nano_nccl::sim::CostProfile& profile, int 
         std::printf("\n");
         std::printf("  route %.1f  counts %.1f  pipeline %.1f  reduce %.1f  total %.1f (us, slowest rank)\n", s.route,
                     s.counts, s.pipeline, s.reduce, s.total);
+        if (a.mode == "ffn") {
+            // The planner's estimate of the plan that ran, against the simulated pipeline.
+            std::vector<std::int64_t> global;
+            for (const auto& row : counts) global.insert(global.end(), row.begin(), row.end());
+            const auto est = nano_nccl::planner::estimate_layer_ns(cost_model(a, profile, c.hidden, c.slot_bytes),
+                                                                   a.world, a.experts, global, ran, overlap, lookahead);
+            std::printf("cost_model estimate=%.1f pipeline=%.1f\n", est / 1000.0, s.pipeline);
+        }
         print_utilization(res);
         if (a.timeline) print_timeline(res, 0, nullptr);
     }
@@ -260,6 +294,8 @@ int main(int argc, char** argv) {
             else if (arg == "--copy-scale") a.copy_scale = std::atof(next());
             else if (arg == "--compute-scale") a.compute_scale = std::atof(next());
             else if (arg == "--no-contention") a.contention = false;
+            else if (arg == "--fallback-permille") a.fallback_permille = std::atoi(next());
+            else if (arg == "--search-passes") a.search_passes = std::atoi(next());
             else throw std::invalid_argument("unknown argument " + arg);
         }
         if (a.profile.empty()) throw std::invalid_argument("--profile is required");

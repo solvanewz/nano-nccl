@@ -1,6 +1,7 @@
 #include "cost_profile.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
@@ -149,6 +150,61 @@ void CostProfile::save(const std::string& path) const {
     if (!f) throw std::runtime_error("cannot write profile " + path);
     f << serialize();
     if (!f) throw std::runtime_error("short write to " + path);
+}
+
+FabricRates link_rates(double gbps, double message_us, std::size_t chunk_bytes, double exchange_us) {
+    if (!(gbps > 0)) throw std::invalid_argument("link_rates: gbps must be positive");
+    FabricRates f;
+    f.tx_us_per_mib = f.rx_us_per_mib = 1048576.0 * 8 / (gbps * 1e3);
+    f.message_us = message_us;
+    f.chunk_bytes = chunk_bytes;
+    f.exchange_us = exchange_us;
+    return f;
+}
+
+FabricRates copy_rates(const CostProfile& p, std::size_t chunk_bytes) {
+    if (chunk_bytes == 0) throw std::invalid_argument("copy_rates: chunk_bytes must be positive");
+    const double mib = static_cast<double>(chunk_bytes) / 1048576.0;
+    FabricRates f;
+    f.tx_us_per_mib = p.table(cost::kTxRemote)(static_cast<double>(chunk_bytes)) / mib;
+    f.rx_us_per_mib = p.table(cost::kRxRemote)(static_cast<double>(chunk_bytes)) / mib;
+    f.message_us = p.scalar(cost::kHostPost);
+    f.chunk_bytes = chunk_bytes;
+    f.exchange_us = p.scalar(cost::kCopyLatency) + p.scalar(cost::kHostExchangeIssue);
+    return f;
+}
+
+planner::CostModel planner_cost_model(const CostProfile& p, int hidden, double compute_scale,
+                                      const FabricRates& fabric) {
+    auto ns = [](double us) { return static_cast<std::int64_t>(std::llround(us * 1000.0)); };
+    auto table = [&](const char* name, double scale) {
+        std::vector<std::pair<std::int64_t, std::int64_t>> pts;
+        for (const auto& [x, y] : p.table(name).points()) {
+            pts.push_back({static_cast<std::int64_t>(std::llround(x)), ns(y * scale)});
+        }
+        return planner::IntTable(std::move(pts));
+    };
+    planner::CostModel m;
+    m.row_bytes = static_cast<std::int64_t>(hidden) * 2;  // bf16
+    m.expert_ns = table(cost::kExpertFfn, compute_scale);
+    m.permute_ns = table(cost::kPermute, compute_scale);
+    m.expert_issue_ns = table(cost::kHostExpertIssue, 1.0);
+    auto ps_per_byte = [](double us_per_mib) {
+        return static_cast<std::int64_t>(std::llround(us_per_mib * 1e6 / 1048576.0));
+    };
+    m.tx_ps_per_byte = ps_per_byte(fabric.tx_us_per_mib);
+    m.rx_ps_per_byte = ps_per_byte(fabric.rx_us_per_mib);
+    m.message_ns = ns(fabric.message_us);
+    m.chunk_bytes = static_cast<std::int64_t>(fabric.chunk_bytes);
+    m.exchange_ns = ns(fabric.exchange_us);
+    m.validate();
+    return m;
+}
+
+const Table& schedule_table(const CostProfile& p, const std::string& scheduler, int world) {
+    const std::string base = std::string(cost::kHostSchedule) + scheduler;
+    const std::string at_world = base + "_w" + std::to_string(world);
+    return p.tables.count(at_world) ? p.tables.at(at_world) : p.table(base);
 }
 
 }  // namespace nano_nccl::sim

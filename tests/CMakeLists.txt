@@ -175,7 +175,7 @@ if(NANO_NCCL_ENABLE_MPI)
     # EP MoE layer over ShmWire; the probe matrix is bit-exact, --ffn runs
     # real experts (checked by ep_moe_reference.py).
     add_executable(nano_nccl_ep_moe_test ep_moe_test.cu)
-    target_link_libraries(nano_nccl_ep_moe_test PRIVATE nano_nccl_ep nano_nccl_exec nano_nccl_peer_shm)
+    target_link_libraries(nano_nccl_ep_moe_test PRIVATE nano_nccl_ep nano_nccl_exec nano_nccl_peer_shm nano_nccl_sim)
     if(BUILD_TESTING)
         foreach(np IN ITEMS 2 4)
             add_test(

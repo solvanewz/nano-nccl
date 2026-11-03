@@ -11,18 +11,23 @@
 //       and an empty group followed by one group per rank's experts, i.e.
 //       the plan shapes a B2 scheduler may produce), plus plans computed from
 //       each forward's counts (exec::PlanTiming::kFromCounts: token_greedy,
-//       and fixed through the same program). D slows every
+//       cost_aware with a communication-heavy synthetic cost model and no
+//       fallback, and fixed through the same program). D slows every
 //       ShmWire copy (ShmWireConfig::debug_copy_delay_us), so data used
 //       before it is readable shows up as wrong output.
 //   ep_moe_test --ffn [--tokens T --experts E --topk K --hidden H --ffn-dim F
 //                      --iters N --skew X --groups G --lookahead L
 //                      --no-overlap --scheduler NAME --plan-from-counts
-//                      --random-plan SEED --workload NAME --dump DIR --trace FILE]
+//                      --random-plan SEED --workload NAME --dump DIR --trace FILE
+//                      --cost-profile P --fallback-permille N]
 //       real BF16 SwiGLU experts; the group plan comes from the scheduler
 //       (planner::make_schedule, default fixed = B1) with G groups, computed
 //       from each forward's counts when the scheduler reads them or with
 //       --plan-from-counts (exec::plan_source_for), or with --random-plan
-//       from planner::random_group_plan over at most G groups.
+//       from planner::random_group_plan over at most G groups. cost_aware
+//       needs --cost-profile (an ep_profile/calibrated profile): its model is
+//       sim::planner_cost_model over the profile's host-staged copy rates,
+//       the same one nano_ep_sim builds, so a replay reproduces the plan.
 //       Prints stage times and the step timeline, and checks that the output
 //       is bit-identical to a serial (one group, no overlap) forward. With
 //       --dump, writes inputs, weights and outputs for
@@ -30,6 +35,7 @@
 #include "ep/moe_layer.h"
 #include "ep/synthetic_routing.h"
 #include "exec/exec_trace.h"
+#include "cost_profile.h"
 #include "planner/scheduler.h"
 #include "transport/peer/peer_exchanger.h"
 #include "transport/peer/shm_wire.h"
@@ -136,6 +142,7 @@ enum class PlanKind {
     kRankMajor,  // an empty group, then one group per rank's experts, last rank first
     kGreedy,     // token_greedy from each forward's counts; groups 0: num_experts / 2
     kFixedFromCounts,  // fixed (groups 0: experts per rank) through the kFromCounts program
+    kCostAware,  // cost_aware from each forward's counts (probe_cost_model); groups 0: num_experts / 2
 };
 
 struct Variant {
@@ -161,7 +168,26 @@ constexpr Variant kVariants[] = {
     {"greedy_l2", 0, true, 2, PlanKind::kGreedy, 0},
     {"greedy_no_overlap", 3, false, 0, PlanKind::kGreedy, 0},
     {"fixed_from_counts_l1", 0, true, 1, PlanKind::kFixedFromCounts, 0},
+    {"aware_l2", 0, true, 2, PlanKind::kCostAware, 0},
+    {"aware_no_overlap", 3, false, 0, PlanKind::kCostAware, 0},
 };
+
+// cost_aware model for the probe runs: traffic dominates and there is no
+// fallback, so the search moves experts and reorders steps (a data-path
+// test, not a performance model).
+nano_nccl::planner::CostModel probe_cost_model(const EpShape& s) {
+    namespace pl = nano_nccl::planner;
+    pl::CostModel m;
+    m.row_bytes = static_cast<std::int64_t>(s.hidden) * 2;
+    m.expert_ns = pl::IntTable({{1, 10000}, {1024, 30000}});
+    m.permute_ns = pl::IntTable({{1, 1000}});
+    m.expert_issue_ns = pl::IntTable({{0, 1000}});
+    m.tx_ps_per_byte = m.rx_ps_per_byte = 2000;
+    m.message_ns = 1000;
+    m.exchange_ns = 1000;
+    m.fallback_permille = 0;
+    return m;
+}
 
 GroupPlan make_group_plan(const EpShape& s, const Variant& v);
 
@@ -172,6 +198,13 @@ exec::PlanSource make_plan_source(const EpShape& s, const Variant& v) {
     if (v.kind == PlanKind::kGreedy) {
         const int groups = std::min(v.groups == 0 ? std::max(1, s.num_experts / 2) : v.groups, s.num_experts);
         return exec::PlanSource::from_counts(pl::SchedulerKind::kTokenGreedy, groups);
+    }
+    if (v.kind == PlanKind::kCostAware) {
+        auto src = exec::PlanSource::from_counts(
+            pl::SchedulerKind::kCostAware,
+            std::min(v.groups == 0 ? std::max(1, s.num_experts / 2) : v.groups, s.num_experts));
+        src.cost = std::make_shared<const pl::CostModel>(probe_cost_model(s));
+        return src;
     }
     if (v.kind == PlanKind::kFixedFromCounts) {
         return exec::PlanSource::from_counts(pl::SchedulerKind::kFixed, v.groups == 0 ? epr : v.groups);
@@ -207,6 +240,7 @@ GroupPlan make_group_plan(const EpShape& s, const Variant& v) {
         }
         case PlanKind::kGreedy:
         case PlanKind::kFixedFromCounts:
+        case PlanKind::kCostAware:
             break;
     }
     throw std::logic_error("make_group_plan: not an ahead plan kind");
@@ -331,6 +365,8 @@ struct FfnArgs {
     std::string trace;  // exec::LayerTrace of the timed runs, written by rank 0
     int slots = 0;
     std::size_t slot_bytes = 0;
+    std::string cost_profile;     // cost_aware: profile for its cost model
+    int fallback_permille = -1;   // cost_aware: override the model's default
 };
 
 // Gathers every rank's counts, stage means and last-iteration op times.
@@ -424,6 +460,14 @@ int run_ffn(const FfnArgs& a) {
     } else {
         plan = exec::plan_source_for(pl::parse_scheduler(a.scheduler), g_world, a.experts, a.groups, a.from_counts);
         plan_name = a.scheduler;
+        if (plan.scheduler == pl::SchedulerKind::kCostAware) {
+            if (a.cost_profile.empty()) throw std::invalid_argument("--scheduler cost_aware needs --cost-profile");
+            const auto prof = nano_nccl::sim::CostProfile::load(a.cost_profile);
+            auto m = nano_nccl::sim::planner_cost_model(prof, a.hidden, 1.0,
+                                                        nano_nccl::sim::copy_rates(prof, g_exchanger->slot_bytes()));
+            if (a.fallback_permille >= 0) m.fallback_permille = a.fallback_permille;
+            plan.cost = std::make_shared<const pl::CostModel>(m);
+        }
     }
     plan_name += std::string(" (") + exec::plan_timing_name(plan.timing) + ")";
     const PipelineOptions options{a.overlap, a.lookahead};
@@ -564,6 +608,8 @@ int main(int argc, char** argv) {
             else if (arg == "--plan-from-counts") a.from_counts = true;
             else if (arg == "--random-plan") a.random_plan = std::atoll(next());
             else if (arg == "--trace") a.trace = next();
+            else if (arg == "--cost-profile") a.cost_profile = next();
+            else if (arg == "--fallback-permille") a.fallback_permille = std::atoi(next());
             else throw std::invalid_argument("unknown argument " + arg);
         }
         a.slots = slots;

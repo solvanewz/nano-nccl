@@ -248,7 +248,7 @@ ForwardTimes MoeLayer::forward(std::uint64_t epoch, const bf16* x, int tokens, c
                             throw std::logic_error("MoeLayer::forward: own counts row differs after the exchange");
                         }
                     }
-                    groups = exec::resolve_plan(source, W, E, global);
+                    groups = exec::resolve_plan(source, options, W, E, global);
                     for (int src = 0; src < W; ++src) {
                         for (int j = 0; j < epr; ++j) {
                             recv_counts[src * epr + j] = global[static_cast<std::size_t>(src) * E + s.first_local_expert() + j];

@@ -21,7 +21,10 @@
 //       (one port per node at G Gb/s, 2 L per message) on the simulator's
 //       own event loop, as a cross-check. --staged models RdmaWire's
 //       host-pinned path (staging copy, then send) instead of GPUDirect
-//       writes (NetConfig::host_staged).
+//       writes (NetConfig::host_staged). cost_aware's cost model is built
+//       from the profile and these network options (cost_model() below;
+//       --fallback-permille N, --search-passes N override its defaults);
+//       ffn runs print that model's estimate of the plan that ran.
 #include "analytical_network.h"
 #include "astra_scheduler.h"
 #include "cost_profile.h"
@@ -38,12 +41,14 @@
 
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -207,7 +212,27 @@ struct Args {
     double compute_scale = 1.0, copy_scale = 1.0;  // GPU op and local copy durations
     double post_overhead_us = 0, arrival_latency_us = 0;  // NetConfig
     unsigned long long seed = 0;                           // routing sample (ep::routing_seed)
+    int fallback_permille = -1, search_passes = -1;        // cost_aware model overrides (-1: default)
 };
+
+// The planner's cost model for this run: profile compute (scaled like the
+// simulation) and what the deployment knows about its network: the link
+// rate, the per-message proxy cost, the path latency (two links) and, for
+// --staged, the staging copies when they are slower than the link.
+nano_nccl::planner::CostModel cost_model(const Args& a, const nsim::CostProfile& p, int hidden,
+                                         std::size_t slot_bytes) {
+    nsim::FabricRates f = nsim::link_rates(a.gbps, a.post_overhead_us, slot_bytes,
+                                           2 * a.latency_us + a.arrival_latency_us);
+    if (a.staged) {
+        const nsim::FabricRates c = nsim::copy_rates(p, slot_bytes);
+        f.tx_us_per_mib = std::max(f.tx_us_per_mib, c.tx_us_per_mib * a.copy_scale);
+        f.rx_us_per_mib = std::max(f.rx_us_per_mib, c.rx_us_per_mib * a.copy_scale);
+    }
+    auto m = nsim::planner_cost_model(p, hidden, a.compute_scale, f);
+    if (a.fallback_permille >= 0) m.fallback_permille = a.fallback_permille;
+    if (a.search_passes >= 0) m.max_passes = a.search_passes;
+    return m;
+}
 
 // SimAI's example ns-3 configuration (inputs/config/SimAI.conf) with the
 // output files moved into `dir` and tracing off.
@@ -403,9 +428,32 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
     };
     c.compute_scale = a.compute_scale;
     c.copy_scale = a.copy_scale;
+    if (c.plan.timing == nano_nccl::exec::PlanTiming::kFromCounts &&
+        c.plan.scheduler == nano_nccl::planner::SchedulerKind::kCostAware) {
+        c.plan.cost = std::make_shared<const nano_nccl::planner::CostModel>(
+            cost_model(a, profile, c.hidden, c.slot_bytes));
+    }
     nsim::LayerSimulation sim(c, counts, tokens, profile, sched, factory);
     drive(sim);
-    return sim.finish();
+    nsim::SimResult res = sim.finish();
+    if (c.mode == "ffn") {
+        // The planner's estimate of the plan that ran, against the simulated
+        // pipeline (first dispatch issue -> last combine, slowest rank).
+        std::vector<std::int64_t> global;
+        for (const auto& row : counts) global.insert(global.end(), row.begin(), row.end());
+        double pipeline = 0;
+        for (const auto& r : res.ranks) {
+            double last = 0;
+            for (int op : r.program.combine) last = std::max(last, r.ops[op].complete);
+            pipeline = std::max(pipeline, last - r.ops[r.program.dispatch[0]].issue_begin);
+        }
+        const auto est = nano_nccl::planner::estimate_layer_ns(cost_model(a, profile, c.hidden, c.slot_bytes),
+                                                               c.world, c.num_experts, global,
+                                                               res.ranks[0].plan.groups, c.options.overlap,
+                                                               c.options.lookahead);
+        std::printf("cost_model estimate=%.1f pipeline=%.1f\n", est / 1000.0, pipeline);
+    }
+    return res;
 }
 
 int report(const Args& a, const nsim::SimResult& res, const nsim::simai::NetFabric& fabric_ref) {
@@ -472,6 +520,8 @@ int main(int argc, char** argv) {
             else if (arg == "--post-overhead-us") a.post_overhead_us = std::atof(next());
             else if (arg == "--arrival-latency-us") a.arrival_latency_us = std::atof(next());
             else if (arg == "--seed") a.seed = std::strtoull(next(), nullptr, 0);
+            else if (arg == "--fallback-permille") a.fallback_permille = std::atoi(next());
+            else if (arg == "--search-passes") a.search_passes = std::atoi(next());
             else throw std::invalid_argument("unknown option " + arg);
         }
         const int speeds[] = {25, 50, 100, 200, 400, 1600};  // ECN maps of SimAI.conf

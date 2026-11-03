@@ -22,6 +22,9 @@ void validate_request(SchedulerKind kind, const ScheduleRequest& r) {
         }
         return;
     }
+    if (kind == SchedulerKind::kCostAware && !r.cost) {
+        throw std::invalid_argument("ScheduleRequest: scheduler cost_aware needs a cost model");
+    }
     if (r.counts.size() != want) {
         throw std::invalid_argument("ScheduleRequest: counts has " + std::to_string(r.counts.size()) +
                                     " entries, want world * num_experts = " + std::to_string(want));
@@ -31,7 +34,7 @@ void validate_request(SchedulerKind kind, const ScheduleRequest& r) {
     }
 }
 
-constexpr SchedulerKind kAllKinds[] = {SchedulerKind::kFixed, SchedulerKind::kTokenGreedy};
+constexpr SchedulerKind kAllKinds[] = {SchedulerKind::kFixed, SchedulerKind::kTokenGreedy, SchedulerKind::kCostAware};
 
 GroupPlan token_greedy_plan(const ScheduleRequest& r) {
     const int W = r.world, E = r.num_experts, G = r.groups, epr = E / W;
@@ -79,6 +82,76 @@ GroupPlan token_greedy_plan(const ScheduleRequest& r) {
     return plan;
 }
 
+GroupPlan cost_aware_plan(const ScheduleRequest& r) {
+    const int W = r.world, E = r.num_experts, G = r.groups, epr = E / W;
+    const CostModel& m = *r.cost;
+    PlanEvaluator ev(m, W, E, r.counts, r.overlap, r.lookahead);
+    // Baseline: token_greedy, or fixed when it is estimated clearly faster.
+    // The plan from counts pays the dynamic program either way, and fixed is
+    // the plan the estimate flatters most (it has the most messages), so a
+    // tie keeps token_greedy.
+    const GroupPlan greedy = token_greedy_plan(r);
+    ev.load(greedy);
+    const std::int64_t greedy_est = ev.estimate();
+    GroupPlan baseline = greedy;
+    std::int64_t baseline_est = greedy_est;
+    if (G <= epr) {
+        GroupPlan fixed = fixed_group_plan(W, E, G);
+        ev.load(fixed);
+        const std::int64_t fixed_est = ev.estimate();
+        if (fixed_est * 1000 < greedy_est * (1000 - m.fallback_permille)) {
+            baseline = std::move(fixed);
+            baseline_est = fixed_est;
+        }
+    }
+    ev.load(baseline);
+    std::int64_t best = baseline_est;
+    std::vector<int> candidates;
+    int evaluations = 0;
+    for (int pass = 0; pass < m.max_passes && evaluations < m.max_evaluations; ++pass) {
+        // Experts of the two bottleneck cells: the (group, rank) with the most
+        // compute and the one receiving the most rows; ascending id.
+        candidates.clear();
+        for (const auto& [g, rank] : {ev.busiest_compute_cell(), ev.busiest_receive_cell()}) {
+            for (int e = rank * epr; e < (rank + 1) * epr; ++e) {
+                if (ev.plan().expert_group[e] == g) candidates.push_back(e);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end());
+        candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+        std::int64_t pass_best = best;
+        int move_expert = -1, move_to = -1, swap_at = -1;
+        for (int e : candidates) {
+            const int from = ev.plan().expert_group[e];
+            for (int g = 0; g < G && evaluations < m.max_evaluations; ++g) {
+                if (g == from) continue;
+                ev.move(e, g);
+                const std::int64_t v = ev.estimate(pass_best);
+                ++evaluations;
+                if (v < pass_best) pass_best = v, move_expert = e, move_to = g, swap_at = -1;
+                ev.move(e, from);
+            }
+        }
+        for (int i = 0; i + 1 < G && evaluations < m.max_evaluations; ++i) {
+            ev.swap_order(i, i + 1);
+            const std::int64_t v = ev.estimate(pass_best);
+            ++evaluations;
+            if (v < pass_best) pass_best = v, move_expert = -1, swap_at = i;
+            ev.swap_order(i, i + 1);
+        }
+        if (pass_best >= best) break;
+        if (swap_at >= 0) {
+            ev.swap_order(swap_at, swap_at + 1);
+        } else {
+            ev.move(move_expert, move_to);
+        }
+        best = pass_best;
+    }
+    // Only a clear estimated gain replaces the baseline.
+    if (best * 1000 > baseline_est * (1000 - m.fallback_permille)) return baseline;
+    return ev.plan();
+}
+
 }  // namespace
 
 const char* scheduler_name(SchedulerKind kind) {
@@ -87,6 +160,8 @@ const char* scheduler_name(SchedulerKind kind) {
             return "fixed";
         case SchedulerKind::kTokenGreedy:
             return "token_greedy";
+        case SchedulerKind::kCostAware:
+            return "cost_aware";
     }
     return "?";
 }
@@ -105,6 +180,7 @@ bool scheduler_reads_counts(SchedulerKind kind) {
         case SchedulerKind::kFixed:
             return false;
         case SchedulerKind::kTokenGreedy:
+        case SchedulerKind::kCostAware:
             return true;
     }
     return false;
@@ -119,6 +195,9 @@ GroupPlan make_schedule(SchedulerKind kind, const ScheduleRequest& request) {
             break;
         case SchedulerKind::kTokenGreedy:
             plan = token_greedy_plan(request);
+            break;
+        case SchedulerKind::kCostAware:
+            plan = cost_aware_plan(request);
             break;
     }
     validate_group_plan(plan, request.num_experts);

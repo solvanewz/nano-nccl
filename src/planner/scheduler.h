@@ -1,8 +1,10 @@
 #pragma once
 
+#include "planner/cost_model.h"
 #include "planner/group_plan.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -14,6 +16,11 @@
 //   token_greedy  simple strong baseline for B2: balances expert rows per
 //                 step across ranks (see make_schedule()); ignores where the
 //                 rows come from, i.e. communication.
+//   cost_aware    B2: picks the plan with the smallest estimated layer time
+//                 under a CostModel (compute, traffic per rank and step, the
+//                 pipeline's issue order); keeps its baseline (token_greedy,
+//                 or fixed when clearly better) when the gain is too small to
+//                 trust the estimate.
 //
 // Schedulers take the same request and return the same GroupPlan, so the
 // layer and the simulator need no changes beyond selecting them.
@@ -22,6 +29,7 @@ namespace nano_nccl::planner {
 enum class SchedulerKind : int {
     kFixed = 0,
     kTokenGreedy,
+    kCostAware,
 };
 
 const char* scheduler_name(SchedulerKind kind);
@@ -36,6 +44,11 @@ struct ScheduleRequest {
     // Every rank must pass the same values. May be empty for a scheduler that
     // does not read it (scheduler_reads_counts() == false).
     std::vector<std::int64_t> counts;
+    // cost_aware only: the pipeline the plan will run with (exec::PipelineOptions)
+    // and the cost model; both must be identical on every rank.
+    bool overlap = true;
+    int lookahead = 1;
+    std::shared_ptr<const CostModel> cost = nullptr;
 };
 
 bool scheduler_reads_counts(SchedulerKind kind);
@@ -53,6 +66,16 @@ bool scheduler_reads_counts(SchedulerKind kind);
 // k. Order: the group with the smallest step maximum (max over r of
 // load(r, g)) first, so a short first dispatch starts the pipeline early, then
 // descending step maximum, so the last, exposed step is short; ties by id.
+//
+// cost_aware (needs request.cost): the baseline is token_greedy, or fixed
+// (groups <= experts per rank) when the CostModel estimates it at least
+// CostModel::fallback_permille faster. From the baseline it runs a bounded
+// local search: each pass tries moving every expert of the two bottleneck
+// cells (the (group, rank) with the most compute and the one receiving the
+// most rows) to every other group, and swapping adjacent steps, then applies
+// the single best strict improvement; at most CostModel::max_passes passes
+// and max_evaluations estimates. Returns the baseline unless the result is
+// estimated at least fallback_permille faster than it.
 GroupPlan make_schedule(SchedulerKind kind, const ScheduleRequest& request);
 
 // Test generator, not a scheduler: a random expert -> group mapping over

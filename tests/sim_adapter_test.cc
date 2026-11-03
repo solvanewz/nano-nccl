@@ -27,6 +27,7 @@
 #include <cmath>
 #include <cstdio>
 #include <exception>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -89,6 +90,8 @@ CostProfile synthetic_profile(bool contention = false) {
     t(cost::kPack, {{0, 4}, {100000, 90}});
     t("host_schedule_us_fixed", {{1, 1}});
     t("host_schedule_us_token_greedy", {{1, 2}, {1000, 40}});
+    t("host_schedule_us_cost_aware", {{1, 5}, {1000, 100}});
+    t("host_schedule_us_cost_aware_w2", {{1, 9}, {1000, 90}});  // measured at world 2: preferred there
     p.scalars = {{cost::kHostRouteIssue, 10}, {cost::kHostReduceIssue, 3}, {cost::kHostExchangeIssue, 1},
                  {cost::kHostCountIssue, 4},  {cost::kHostPackIssue, 7},
                  {cost::kHostPost, 2},        {cost::kHostCopyOut, 2},     {cost::kHostPoll, 0.5},
@@ -229,7 +232,7 @@ void check_invariants(const Case& c, const SimResult& res, const CostProfile& pr
         if (rr.program.timing != nano_nccl::exec::PlanTiming::kFromCounts) continue;
         std::vector<std::int64_t> global;
         for (const auto& row : c.counts) global.insert(global.end(), row.begin(), row.end());
-        const auto want = nano_nccl::exec::resolve_plan(c.config.plan, W, c.config.num_experts, global);
+        const auto want = nano_nccl::exec::resolve_plan(c.config.plan, c.config.options, W, c.config.num_experts, global);
         require(rr.plan.groups.expert_group == want.expert_group && rr.plan.groups.order == want.order,
                 "plan is not the scheduler's plan for the global counts");
         const double packed = rr.ops[rr.program.pack].gpu_end;
@@ -400,7 +403,8 @@ void test_random(int trials) {
             std::shuffle(g.order.begin(), g.order.end(), rng);
             s.plan = PlanSource::ahead(g);
         } else if (pick == 2) {
-            s.plan = PlanSource::from_counts(nano_nccl::planner::SchedulerKind::kTokenGreedy,
+            s.plan = PlanSource::from_counts(rng() % 2 ? nano_nccl::planner::SchedulerKind::kTokenGreedy
+                                                       : nano_nccl::planner::SchedulerKind::kCostAware,
                                              1 + static_cast<int>(rng() % s.num_experts));
         } else {
             s.plan = PlanSource::from_counts(nano_nccl::planner::SchedulerKind::kFixed, 1 + static_cast<int>(rng() % epr));
@@ -408,6 +412,10 @@ void test_random(int trials) {
         s.options = {rng() % 3 != 0, static_cast<int>(rng() % 5)};
         s.slots_per_link = 1 + static_cast<int>(rng() % 4);
         s.slot_bytes = std::size_t{1} << (9 + rng() % 8);  // 512 B .. 64 KiB: many chunks per message
+        if (s.plan.scheduler == nano_nccl::planner::SchedulerKind::kCostAware) {
+            s.plan.cost = std::make_shared<const nano_nccl::planner::CostModel>(nano_nccl::sim::planner_cost_model(
+                plain, s.hidden, 1.0, nano_nccl::sim::copy_rates(plain, s.slot_bytes)));
+        }
         for (int r = 0; r < s.world; ++r) {
             std::vector<std::int64_t> n(s.num_experts);
             for (auto& x : n) x = rng() % 3 == 0 ? 0 : static_cast<std::int64_t>(rng() % 40);
@@ -474,6 +482,27 @@ void test_plan_from_counts() {
     require(g.expert_group[0] == g.expert_group[7] && g.expert_group[1] == g.expert_group[6] &&
                 g.expert_group[0] != g.expert_group[1],
             "token_greedy plan in the simulator");
+    // cost_aware: the scheduler with the profile's model runs at the plan op
+    // (check_invariants: the plan is make_schedule's on the global counts with
+    // that model), charged with the table measured at this world.
+    c.config.plan = PlanSource::from_counts(nano_nccl::planner::SchedulerKind::kCostAware, 2);
+    c.config.plan.cost = std::make_shared<const nano_nccl::planner::CostModel>(nano_nccl::sim::planner_cost_model(
+        prof, c.config.hidden, 1.0, nano_nccl::sim::copy_rates(prof, c.config.slot_bytes)));
+    const SimResult aware = run(c, prof);
+    check_invariants(c, aware, prof);
+    const auto& ap = aware.ranks[0].ops[aware.ranks[0].program.plan];
+    require(near(ap.issue_end - ap.issue_begin,
+                 prof.table(cost::kHostPlan)(2) + prof.table("host_schedule_us_cost_aware_w2")(8 * 2)),
+            "cost_aware plan op cost (world-specific scheduler table)");
+    require(near(nano_nccl::sim::schedule_table(prof, "cost_aware", 4)(16), prof.table("host_schedule_us_cost_aware")(16)),
+            "scheduler table fallback for another world");
+    // The model reads the profile: 1 ns resolution, the copy rate per MiB.
+    const auto m = nano_nccl::sim::planner_cost_model(prof, 256, 2.0, nano_nccl::sim::copy_rates(prof, 1 << 20));
+    require(m.expert_ns(1000) == 60000 && m.permute_ns(0) == 2000 && m.expert_issue_ns(8) == 40000,
+            "cost model tables (compute scaled 2x, issue not)");
+    require(m.row_bytes == 512 && m.tx_ps_per_byte == 76 && m.rx_ps_per_byte == 76 && m.message_ns == 2000 &&
+                m.chunk_bytes == (1 << 20) && m.exchange_ns == 3000,
+            "cost model fabric from the copy tables");
 }
 
 double expert_launch(const SimResult& r, int rank, int step) {

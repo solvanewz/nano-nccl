@@ -84,14 +84,17 @@ PlanSource plan_source_for(planner::SchedulerKind kind, int world, int num_exper
     return PlanSource::ahead(planner::make_schedule(kind, {world, num_experts, groups, {}}));
 }
 
-planner::GroupPlan resolve_plan(const PlanSource& source, int world, int num_experts,
-                                const std::vector<std::int64_t>& global_counts) {
+planner::GroupPlan resolve_plan(const PlanSource& source, const PipelineOptions& options, int world,
+                                int num_experts, const std::vector<std::int64_t>& global_counts) {
     if (source.timing == PlanTiming::kAhead) {
         planner::validate_group_plan(source.plan, num_experts);
         return source.plan;
     }
     planner::ScheduleRequest request{world, num_experts, source.groups, {}};
     if (planner::scheduler_reads_counts(source.scheduler)) request.counts = global_counts;
+    request.overlap = options.overlap;
+    request.lookahead = options.lookahead;
+    request.cost = source.cost;
     return planner::make_schedule(source.scheduler, request);
 }
 

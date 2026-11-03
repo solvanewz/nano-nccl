@@ -1,6 +1,7 @@
 #pragma once
 
 #include "exec/exec_program.h"
+#include "planner/cost_model.h"
 
 #include <map>
 #include <string>
@@ -124,5 +125,30 @@ inline constexpr const char* kCopyRxComputeFactor = "copy_rx_compute_factor";
 // sim_adapter/calibrate_copies.py --gpu-pair measures it per rank in situ.
 inline constexpr const char* kGpuCopySlowdown = "gpu_copy_slowdown";
 }  // namespace cost
+
+// What a deployment knows about its fabric, for the planner's cost model:
+// per rank and direction, the transfer rate and the cost of each message.
+struct FabricRates {
+    double tx_us_per_mib = 0;
+    double rx_us_per_mib = 0;
+    double message_us = 0;        // per message on the sending (chunk) / receiving (credit) side
+    std::size_t chunk_bytes = 0;  // payload per message
+    double exchange_us = 0;       // fixed per exchange
+};
+// A network link of `gbps` in each direction.
+FabricRates link_rates(double gbps, double message_us, std::size_t chunk_bytes, double exchange_us);
+// The profile's host-staged local copies (A40 ShmWire): a remote chunk is a
+// tx copy on the sender and an rx copy on the receiver, measured per chunk.
+FabricRates copy_rates(const CostProfile& p, std::size_t chunk_bytes);
+
+// planner::CostModel from the profile's expert, permute and expert-issue
+// tables (ffn mode; scaled by compute_scale like the simulator's GPU ops)
+// and the fabric. Integer ns / ps, rounded.
+planner::CostModel planner_cost_model(const CostProfile& p, int hidden, double compute_scale,
+                                      const FabricRates& fabric);
+
+// Scheduler run time table for `scheduler` at `world`: "host_schedule_us_<name>_w<world>"
+// when the profile has it (measured at that world), else "host_schedule_us_<name>".
+const Table& schedule_table(const CostProfile& p, const std::string& scheduler, int world);
 
 }  // namespace nano_nccl::sim

@@ -6,9 +6,11 @@
 // reaches its expert exactly once and in a deterministic order, that every
 // layout passes the exchanger's validation, and that every row returns to the
 // position it was sent from. Also checks the scheduler switch
-// (src/planner/scheduler) and its random test plans.
+// (src/planner/scheduler) and its random test plans, and the cost model and
+// cost_aware scheduler (src/planner/cost_model).
 #include "ep/ep_plan.h"
 #include "ep/synthetic_routing.h"
+#include "planner/cost_model.h"
 #include "planner/group_plan.h"
 #include "planner/scheduler.h"
 
@@ -17,6 +19,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -69,6 +72,24 @@ GroupPlan random_plan(std::mt19937_64& rng, int world, int experts) {
     return plan;
 }
 
+// A cost model with A40-like shapes (fixed cost per expert, per-message
+// overhead) and random rates.
+nano_nccl::planner::CostModel random_cost_model(std::mt19937_64& rng) {
+    namespace pl = nano_nccl::planner;
+    pl::CostModel m;
+    m.row_bytes = 64 + static_cast<std::int64_t>(rng() % 4096);
+    const std::int64_t fixed = static_cast<std::int64_t>(rng() % 50000);
+    m.expert_ns = pl::IntTable({{1, fixed}, {1024, fixed + 1 + static_cast<std::int64_t>(rng() % 300000)}});
+    m.permute_ns = pl::IntTable({{1, 2000}, {1024, 2000 + static_cast<std::int64_t>(rng() % 20000)}});
+    m.expert_issue_ns = pl::IntTable({{0, 5000}, {8, 5000 + static_cast<std::int64_t>(rng() % 100000)}});
+    m.tx_ps_per_byte = static_cast<std::int64_t>(rng() % 400);
+    m.rx_ps_per_byte = static_cast<std::int64_t>(rng() % 400);
+    m.message_ns = static_cast<std::int64_t>(rng() % 10000);
+    m.chunk_bytes = rng() % 2 ? 0 : 1 + static_cast<std::int64_t>(rng() % 100000);
+    m.exchange_ns = static_cast<std::int64_t>(rng() % 5000);
+    return m;
+}
+
 void run_trial(std::mt19937_64& rng, int trial) {
     const int worlds[] = {1, 2, 3, 4, 8};
     const int W = worlds[rng() % 5];
@@ -83,7 +104,13 @@ void run_trial(std::mt19937_64& rng, int trial) {
     if (rng() % 4 == 0) {  // a plan that depends on these counts
         nano_nccl::planner::ScheduleRequest req{W, E, 1 + static_cast<int>(rng() % E), {}};
         for (const auto& row : N) req.counts.insert(req.counts.end(), row.begin(), row.end());
-        groups = nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kTokenGreedy, req);
+        auto kind = nano_nccl::planner::SchedulerKind::kTokenGreedy;
+        if (rng() % 2 == 0) {
+            kind = nano_nccl::planner::SchedulerKind::kCostAware;
+            req.cost = std::make_shared<const nano_nccl::planner::CostModel>(random_cost_model(rng));
+            req.lookahead = static_cast<int>(rng() % 3);
+        }
+        groups = nano_nccl::planner::make_schedule(kind, req);
     }
 
     std::vector<EpShape> shapes;
@@ -205,7 +232,7 @@ bool test_scheduler() {
             ok = false;
         }
     };
-    for (pl::SchedulerKind k : {pl::SchedulerKind::kFixed, pl::SchedulerKind::kTokenGreedy}) {
+    for (pl::SchedulerKind k : {pl::SchedulerKind::kFixed, pl::SchedulerKind::kTokenGreedy, pl::SchedulerKind::kCostAware}) {
         check(pl::parse_scheduler(pl::scheduler_name(k)) == k, std::string("name round trip ") + pl::scheduler_name(k));
     }
     for (int W : {1, 2, 4, 8}) {
@@ -333,6 +360,137 @@ bool test_token_greedy() {
     return ok;
 }
 
+// The cost model: table rule, a hand-computed estimate, incremental
+// evaluation equal to a fresh one, and cost_aware's guarantees.
+bool test_cost_model() {
+    namespace pl = nano_nccl::planner;
+    bool ok = true;
+    auto check = [&ok](bool cond, const std::string& what) {
+        if (!cond) {
+            std::printf("FAIL cost_model: %s\n", what.c_str());
+            ok = false;
+        }
+    };
+    {
+        const pl::IntTable t({{0, 0}, {10, 100}});
+        check(t(-5) == 0 && t(5) == 50 && t(10) == 100 && t(20) == 200, "table interpolation");
+        check(pl::IntTable({{1, 7}})(100) == 7, "single-point table");
+        check(pl::IntTable({{0, 100}, {10, 50}})(100) == 0, "extrapolation clamps at 0");
+    }
+    // Hand example: 1 ns per row of compute, 1 ns per byte on each side, one
+    // byte per row, nothing else. W = 2, E = 4; N(0, .) = {4, 0, 2, 0},
+    // N(1, .) = {0, 0, 6, 1}: rows {4, 0, 8, 1}; rank 0 sends 2 rows to
+    // expert 2, rank 1 sends nothing remote.
+    pl::CostModel unit;
+    unit.row_bytes = 1;
+    unit.expert_ns = pl::IntTable({{0, 0}, {1000, 1000}});
+    unit.permute_ns = pl::IntTable({{0, 0}});
+    unit.expert_issue_ns = pl::IntTable({{0, 0}});
+    unit.tx_ps_per_byte = unit.rx_ps_per_byte = 1000;
+    const std::vector<std::int64_t> hand{4, 0, 2, 0, 0, 0, 6, 1};
+    // One group: dispatch 2, rank 1 computes 8 + 1, combine 2.
+    check(pl::estimate_layer_ns(unit, 2, 4, hand, pl::fixed_group_plan(2, 4, 1), true, 1) == 13, "hand G1");
+    // Fixed G2 = {e0, e2}, {e1, e3}, L1: both dispatches end at 2; step 0
+    // ends at 2 + 8 on rank 1, its combine at 12; step 1 (expert 3, 1 row)
+    // ends at 11 and its empty combine waits for rank 1's sides until 12.
+    check(pl::estimate_layer_ns(unit, 2, 4, hand, pl::fixed_group_plan(2, 4, 2), true, 1) == 12, "hand G2 L1");
+    // Serial: the empty second dispatch starts at 12, rank 1 ends at 13.
+    check(pl::estimate_layer_ns(unit, 2, 4, hand, pl::fixed_group_plan(2, 4, 2), false, 0) == 13, "hand G2 serial");
+    // 5 ns per message, one per peer and side: every side of every exchange
+    // gets 5 more. Dispatch ends at 2 + 5, rank 1 computes until 16; the
+    // combine's busiest sides (rank 1 sends 2 rows, rank 0 receives them)
+    // end at 16 + 7.
+    pl::CostModel msg = unit;
+    msg.message_ns = 5;
+    check(pl::estimate_layer_ns(msg, 2, 4, hand, pl::fixed_group_plan(2, 4, 1), true, 1) == 23, "hand messages");
+    // Plus one message per byte (chunk_bytes 1): 6 ns per row; dispatch 2 * 6
+    // + 5 = 17, experts until 26, combine until 43.
+    msg.chunk_bytes = 1;
+    check(pl::estimate_layer_ns(msg, 2, 4, hand, pl::fixed_group_plan(2, 4, 1), true, 1) == 43, "hand chunks");
+
+    std::mt19937_64 rng(4242);
+    int incremental = 0, aware_trials = 0, fell_back = 0, beat_greedy = 0;
+    double aware_sum = 0, greedy_sum = 0, fixed_sum = 0;
+    for (int trial = 0; trial < 600; ++trial) {
+        const int W = 1 << (rng() % 4), epr = 1 + static_cast<int>(rng() % 8), E = W * epr;
+        const int G = 1 + static_cast<int>(rng() % std::min(E, 12));
+        const bool overlap = rng() % 4 != 0;
+        const int L = static_cast<int>(rng() % 4);
+        const pl::CostModel m = random_cost_model(rng);
+        std::vector<std::int64_t> counts(static_cast<std::size_t>(W) * E);
+        for (auto& n : counts) n = rng() % 4 == 0 ? 0 : static_cast<std::int64_t>(rng() % (1 + rng() % 2000));
+        const std::string where = "trial " + std::to_string(trial);
+        // Incremental moves and swaps agree with a fresh estimate.
+        {
+            pl::PlanEvaluator ev(m, W, E, counts, overlap, L);
+            GroupPlan p = pl::random_group_plan(E, G, rng());
+            ev.load(p);
+            for (int step = 0; step < 6; ++step) {
+                if (rng() % 3 == 0 && p.groups() > 1) {
+                    const int i = static_cast<int>(rng() % p.groups()), j = static_cast<int>(rng() % p.groups());
+                    ev.swap_order(i, j);
+                } else {
+                    ev.move(static_cast<int>(rng() % E), static_cast<int>(rng() % p.groups()));
+                }
+                const std::int64_t fresh = pl::estimate_layer_ns(m, W, E, counts, ev.plan(), overlap, L);
+                check(ev.estimate() == fresh, where + ": incremental estimate differs");
+                ++incremental;
+            }
+        }
+        pl::ScheduleRequest req{W, E, G, counts};
+        req.overlap = overlap;
+        req.lookahead = L;
+        req.cost = std::make_shared<const pl::CostModel>(m);
+        const GroupPlan a = pl::make_schedule(pl::SchedulerKind::kCostAware, req);
+        check(a.groups() == G, where + ": group count");
+        const GroupPlan b = pl::make_schedule(pl::SchedulerKind::kCostAware, req);
+        check(same_plan(a, b), where + ": not deterministic");
+        const std::int64_t ea = pl::estimate_layer_ns(m, W, E, counts, a, overlap, L);
+        const GroupPlan g = pl::make_schedule(pl::SchedulerKind::kTokenGreedy, req);
+        const std::int64_t eg = pl::estimate_layer_ns(m, W, E, counts, g, overlap, L);
+        // Baseline: token_greedy unless fixed is estimated clearly faster.
+        GroupPlan base = g;
+        std::int64_t eb = eg;
+        if (G <= epr) {
+            const GroupPlan f = pl::fixed_group_plan(W, E, G);
+            const std::int64_t ef = pl::estimate_layer_ns(m, W, E, counts, f, overlap, L);
+            if (ef * 1000 < eg * (1000 - m.fallback_permille)) base = f, eb = ef;
+            aware_sum += static_cast<double>(ea);
+            fixed_sum += static_cast<double>(ef);
+        }
+        if (same_plan(a, base)) {
+            ++fell_back;
+        } else {
+            // Only a plan estimated clearly faster replaces the baseline.
+            check(ea * 1000 <= eb * (1000 - m.fallback_permille), where + ": replaced the baseline without the margin");
+        }
+        check(ea <= eg, where + ": worse than token_greedy");
+        // A margin of 999 permille always keeps the baseline (token_greedy
+        // unless fixed is 1000x faster).
+        pl::CostModel never = m;
+        never.fallback_permille = 999;
+        pl::ScheduleRequest keep = req;
+        keep.cost = std::make_shared<const pl::CostModel>(never);
+        const GroupPlan kept = pl::make_schedule(pl::SchedulerKind::kCostAware, keep);
+        check(same_plan(kept, g) || (G <= epr && same_plan(kept, pl::fixed_group_plan(W, E, G))),
+              where + ": fallback 999 permille did not keep the baseline");
+        greedy_sum += static_cast<double>(eg);
+        beat_greedy += ea < eg ? 1 : 0;
+        ++aware_trials;
+    }
+    std::printf("cost_aware over %d trials: estimated better than token_greedy in %d, kept the baseline in %d; "
+                "estimate vs fixed %.3f; %d incremental checks\n",
+                aware_trials, beat_greedy, fell_back, aware_sum / fixed_sum, incremental);
+    // Search quality floor on these fixed trials (128 when written): a search
+    // that stops improving shows up here even though the baseline guard
+    // keeps every single plan safe.
+    check(beat_greedy >= 100, "search found too few plans better than token_greedy");
+    check(fell_back > 0, "never kept the baseline");
+    (void)greedy_sum;
+    if (ok) std::printf("PASS cost_model\n");
+    return ok;
+}
+
 // Workload families (ep::Workload): expected expert loads per rank.
 bool test_workloads() {
     namespace ep = nano_nccl::ep;
@@ -440,6 +598,7 @@ int main() {
     bool ok = failed == 0;
     ok &= test_scheduler();
     ok &= test_token_greedy();
+    ok &= test_cost_model();
     ok &= test_workloads();
     ok &= expect_invalid("group_out_of_range", [] {
         nano_nccl::planner::validate_group_plan({{0, 2}, {0, 1}}, 2);
@@ -465,6 +624,16 @@ int main() {
     ok &= expect_invalid("token_greedy_too_many_groups", [] {
         nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kTokenGreedy,
                                           {2, 4, 5, {1, 1, 1, 1, 1, 1, 1, 1}});
+    });
+    ok &= expect_invalid("cost_aware_needs_model", [] {
+        nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kCostAware,
+                                          {2, 4, 2, {1, 1, 1, 1, 1, 1, 1, 1}});
+    });
+    ok &= expect_invalid("int_table_not_ascending", [] { nano_nccl::planner::IntTable({{2, 1}, {1, 1}}); });
+    ok &= expect_invalid("cost_model_incomplete", [] {
+        nano_nccl::planner::CostModel m;
+        m.row_bytes = 1;
+        m.validate();
     });
     ok &= expect_invalid("workload_unknown", [] { nano_nccl::ep::parse_workload("uniform", 0); });
     ok &= expect_invalid("workload_missing_param", [] { nano_nccl::ep::parse_workload("pair", 0); });

@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -58,6 +59,8 @@ struct PlanSource {
     // the scheduler must return exactly that many groups).
     planner::SchedulerKind scheduler = planner::SchedulerKind::kFixed;
     int groups = 0;
+    // kFromCounts with cost_aware: the scheduler's cost model (same on every rank).
+    std::shared_ptr<const planner::CostModel> cost;
 
     static PlanSource ahead(planner::GroupPlan plan);
     static PlanSource from_counts(planner::SchedulerKind scheduler, int groups);
@@ -71,9 +74,10 @@ struct PlanSource {
 PlanSource plan_source_for(planner::SchedulerKind kind, int world, int num_experts, int groups, bool from_counts);
 
 // The invocation's plan. kAhead: source.plan (validated); kFromCounts:
-// planner::make_schedule on `global_counts` (N(s, e) at s * E + e).
-planner::GroupPlan resolve_plan(const PlanSource& source, int world, int num_experts,
-                                const std::vector<std::int64_t>& global_counts);
+// planner::make_schedule on `global_counts` (N(s, e) at s * E + e), with the
+// invocation's pipeline options and source.cost.
+planner::GroupPlan resolve_plan(const PlanSource& source, const PipelineOptions& options, int world,
+                                int num_experts, const std::vector<std::int64_t>& global_counts);
 
 enum class OpKind : int {
     kRoute = 0,  // count kernel, counts copied to the host; kAhead: also place + pack
