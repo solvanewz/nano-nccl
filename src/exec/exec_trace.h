@@ -14,7 +14,8 @@
 //   nano-ep-trace 1
 //   key <exec::ProfileKey::to_string()>
 //   options overlap=<0|1> lookahead=<L> iters=<n>
-//   expert_group <g_0> ... <g_{E-1}>
+//   plan timing=<ahead|from_counts> scheduler=<name>   (optional; default ahead/fixed)
+//   expert_group <g_0> ... <g_{E-1}>                     (the plan that ran)
 //   order <group> ...
 //   rank <r> tokens=<t> route=<us> counts=<us> pipeline=<us> reduce=<us> total=<us>
 //   counts <r> <N(r,0)> ... <N(r,E-1)>
@@ -38,8 +39,17 @@ struct TraceRank {
 
 struct LayerTrace {
     ProfileKey key;
-    planner::GroupPlan groups;
+    planner::GroupPlan groups;  // the plan that ran
     PipelineOptions options;
+    // How it was obtained. kFromCounts: the scheduler ran on the global counts
+    // at the plan op, with groups.groups() groups.
+    PlanTiming timing = PlanTiming::kAhead;
+    planner::SchedulerKind scheduler = planner::SchedulerKind::kFixed;
+    // The source that reproduces the run's program and plan.
+    PlanSource source() const {
+        return timing == PlanTiming::kAhead ? PlanSource::ahead(groups)
+                                            : PlanSource::from_counts(scheduler, groups.groups());
+    }
     int iters = 0;
     std::vector<TraceRank> ranks;
     std::vector<TraceOp> ops;  // last timed iteration, every rank

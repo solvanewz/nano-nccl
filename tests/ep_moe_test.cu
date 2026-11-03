@@ -9,16 +9,20 @@
 //       groups with and without overlap, all dispatches ahead, arbitrary
 //       expert->group mappings in arbitrary order with and without overlap,
 //       and an empty group followed by one group per rank's experts, i.e.
-//       the plan shapes a B2 scheduler may produce). D slows every
+//       the plan shapes a B2 scheduler may produce), plus plans computed from
+//       each forward's counts (exec::PlanTiming::kFromCounts: token_greedy,
+//       and fixed through the same program). D slows every
 //       ShmWire copy (ShmWireConfig::debug_copy_delay_us), so data used
 //       before it is readable shows up as wrong output.
 //   ep_moe_test --ffn [--tokens T --experts E --topk K --hidden H --ffn-dim F
 //                      --iters N --skew X --groups G --lookahead L
-//                      --no-overlap --scheduler NAME --random-plan SEED
-//                      --dump DIR --trace FILE]
+//                      --no-overlap --scheduler NAME --plan-from-counts
+//                      --random-plan SEED --dump DIR --trace FILE]
 //       real BF16 SwiGLU experts; the group plan comes from the scheduler
-//       (planner::make_schedule, default fixed = B1) with G groups, or with
-//       --random-plan from planner::random_group_plan over at most G groups.
+//       (planner::make_schedule, default fixed = B1) with G groups, computed
+//       from each forward's counts when the scheduler reads them or with
+//       --plan-from-counts (exec::plan_source_for), or with --random-plan
+//       from planner::random_group_plan over at most G groups.
 //       Prints stage times and the step timeline, and checks that the output
 //       is bit-identical to a serial (one group, no overlap) forward. With
 //       --dump, writes inputs, weights and outputs for
@@ -130,6 +134,8 @@ enum class PlanKind {
     kScrambled,  // arbitrary expert -> group mapping, groups run in reverse
     kRandom,     // planner::random_group_plan: may have empty and one-rank groups
     kRankMajor,  // an empty group, then one group per rank's experts, last rank first
+    kGreedy,     // token_greedy from each forward's counts; groups 0: num_experts / 2
+    kFixedFromCounts,  // fixed (groups 0: experts per rank) through the kFromCounts program
 };
 
 struct Variant {
@@ -152,9 +158,27 @@ constexpr Variant kVariants[] = {
     {"random_l2", 0, true, 2, PlanKind::kRandom, 2},
     {"random_no_overlap", 0, false, 0, PlanKind::kRandom, 3},
     {"rank_major_all_ahead", 0, true, 64, PlanKind::kRankMajor, 0},
+    {"greedy_l2", 0, true, 2, PlanKind::kGreedy, 0},
+    {"greedy_no_overlap", 3, false, 0, PlanKind::kGreedy, 0},
+    {"fixed_from_counts_l1", 0, true, 1, PlanKind::kFixedFromCounts, 0},
 };
 
+GroupPlan make_group_plan(const EpShape& s, const Variant& v);
+
 // Identical on every rank: deterministic in the shape.
+exec::PlanSource make_plan_source(const EpShape& s, const Variant& v) {
+    namespace pl = nano_nccl::planner;
+    const int epr = s.experts_per_rank();
+    if (v.kind == PlanKind::kGreedy) {
+        const int groups = std::min(v.groups == 0 ? std::max(1, s.num_experts / 2) : v.groups, s.num_experts);
+        return exec::PlanSource::from_counts(pl::SchedulerKind::kTokenGreedy, groups);
+    }
+    if (v.kind == PlanKind::kFixedFromCounts) {
+        return exec::PlanSource::from_counts(pl::SchedulerKind::kFixed, v.groups == 0 ? epr : v.groups);
+    }
+    return exec::PlanSource::ahead(make_group_plan(s, v));
+}
+
 GroupPlan make_group_plan(const EpShape& s, const Variant& v) {
     const int epr = s.experts_per_rank();
     switch (v.kind) {
@@ -181,8 +205,11 @@ GroupPlan make_group_plan(const EpShape& s, const Variant& v) {
             for (int r = s.world - 1; r >= 0; --r) plan.order.push_back(r);
             return plan;
         }
+        case PlanKind::kGreedy:
+        case PlanKind::kFixedFromCounts:
+            break;
     }
-    throw std::logic_error("make_group_plan: unknown plan kind");
+    throw std::logic_error("make_group_plan: not an ahead plan kind");
 }
 
 // Returns the number of output values checked on this rank.
@@ -194,7 +221,7 @@ std::uint64_t run_probe_case(const ProbeCase& c, const Variant& variant, std::ui
     MoeLayer layer(*g_exchanger, cfg, nullptr, g_device);
     cudaStream_t stream;
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
-    const GroupPlan plan = make_group_plan(s, variant);
+    const exec::PlanSource plan = make_plan_source(s, variant);
     const PipelineOptions options{variant.overlap, variant.lookahead};
     std::uint64_t checked = 0;
     for (int iter = 0; iter < 3; ++iter) {
@@ -297,6 +324,7 @@ struct FfnArgs {
     int lookahead = 1;
     bool overlap = true;
     std::string scheduler = "fixed";
+    bool from_counts = false;
     long long random_plan = -1;  // >= 0: planner::random_group_plan seed
     std::string dump;
     std::string trace;  // exec::LayerTrace of the timed runs, written by rank 0
@@ -306,7 +334,7 @@ struct FfnArgs {
 
 // Gathers every rank's counts, stage means and last-iteration op times.
 void write_trace(const FfnArgs& a, const EpShape& s, const MoeLayer& layer, const ForwardTimes& last,
-                 const double* sum, const GroupPlan& plan, const PipelineOptions& options) {
+                 const double* sum, const exec::PlanSource& source, const PipelineOptions& options) {
     const exec::LayerProgram& prog = layer.last_program();
     const std::size_t n = prog.ops.size();
     std::vector<double> mine{static_cast<double>(a.tokens)};
@@ -323,7 +351,9 @@ void write_trace(const FfnArgs& a, const EpShape& s, const MoeLayer& layer, cons
     exec::LayerTrace t;
     t.key = exec::ProfileKey{g_world, s.num_experts, s.top_k, s.hidden, s.ffn, a.tokens, "zipf", a.skew,
                              "bf16", "ffn", "shm", a.slots, a.slot_bytes};
-    t.groups = plan;
+    t.groups = layer.last_ep_plan().groups;  // the plan that ran
+    t.timing = source.timing;
+    t.scheduler = source.scheduler;
     t.options = options;
     t.iters = a.iters;
     for (int r = 0; r < g_world; ++r) {
@@ -382,21 +412,20 @@ int run_ffn(const FfnArgs& a) {
     cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate");
 
     namespace pl = nano_nccl::planner;
-    GroupPlan plan;
+    exec::PlanSource plan;
     std::string plan_name;
     if (a.random_plan >= 0) {
-        plan = pl::random_group_plan(a.experts, a.groups, static_cast<std::uint64_t>(a.random_plan));
+        plan = exec::PlanSource::ahead(
+            pl::random_group_plan(a.experts, a.groups, static_cast<std::uint64_t>(a.random_plan)));
         plan_name = "random:" + std::to_string(a.random_plan);
     } else {
-        const pl::SchedulerKind kind = pl::parse_scheduler(a.scheduler);
-        if (pl::scheduler_reads_counts(kind)) {
-            throw std::invalid_argument("scheduler " + a.scheduler + " needs the routing counts (not wired up yet)");
-        }
-        plan = pl::make_schedule(kind, {g_world, a.experts, a.groups, {}});
+        plan = exec::plan_source_for(pl::parse_scheduler(a.scheduler), g_world, a.experts, a.groups, a.from_counts);
         plan_name = a.scheduler;
     }
+    plan_name += std::string(" (") + exec::plan_timing_name(plan.timing) + ")";
     const PipelineOptions options{a.overlap, a.lookahead};
-    constexpr int kStages = 5;
+    // The first five are the trace's stage means.
+    constexpr int kStages = 7;
     double sum[kStages] = {};
     ForwardTimes last;
     const int warmup = 2;
@@ -406,7 +435,7 @@ int run_ffn(const FfnArgs& a) {
         const ForwardTimes t =
             layer.forward(epoch++, dx.ptr, a.tokens, dids.ptr, dw.ptr, dout.ptr, plan, options, stream);
         if (it < warmup) continue;
-        const double v[kStages] = {t.route, t.counts, t.pipeline, t.reduce, t.total};
+        const double v[kStages] = {t.route, t.counts, t.pipeline, t.reduce, t.total, t.plan, t.pack};
         for (int i = 0; i < kStages; ++i) sum[i] += v[i];
         last = t;
     }
@@ -417,6 +446,7 @@ int run_ffn(const FfnArgs& a) {
     MPI_Reduce(&recv_rows, &max_recv, 1, MPI_INT64_T, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&recv_rows, &min_recv, 1, MPI_INT64_T, MPI_MIN, 0, MPI_COMM_WORLD);
 
+    const GroupPlan ran = layer.last_ep_plan().groups;
     // Grouping and overlap must not change a single output bit.
     const auto pipelined = dout.download(x.size());
     MPI_Barrier(MPI_COMM_WORLD);
@@ -430,15 +460,15 @@ int run_ffn(const FfnArgs& a) {
         std::printf("# EP MoE: ranks=%d tokens/rank=%d experts=%d top_k=%d hidden=%d ffn=%d skew=%.2f "
                     "plan=%s groups=%d overlap=%d lookahead=%d\n",
                     g_world, a.tokens, a.experts, a.top_k, a.hidden, a.ffn, a.skew, plan_name.c_str(),
-                    plan.groups(), a.overlap ? 1 : 0, a.lookahead);
+                    ran.groups(), a.overlap ? 1 : 0, a.lookahead);
         std::printf("# expert -> group:");
-        for (int g : plan.expert_group) std::printf(" %d", g);
+        for (int g : ran.expert_group) std::printf(" %d", g);
         std::printf("; order:");
-        for (int g : plan.order) std::printf(" %d", g);
+        for (int g : ran.order) std::printf(" %d", g);
         std::printf("\n");
         std::printf("# expert rows per rank: min %lld max %lld\n", static_cast<long long>(min_recv),
                     static_cast<long long>(max_recv));
-        const char* names[kStages] = {"route", "counts", "pipeline", "reduce", "total"};
+        const char* names[kStages] = {"route", "counts", "pipeline", "reduce", "total", "plan", "pack"};
         std::printf("# stage times, us (mean over %d iters, slowest rank per stage)\n", a.iters);
         for (int i = 0; i < kStages; ++i) std::printf("  %-9s %10.1f\n", names[i], slowest[i] / a.iters);
         std::printf("# rank 0 step timeline of the last iteration, us since forward start\n");
@@ -526,6 +556,7 @@ int main(int argc, char** argv) {
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());
             else if (arg == "--no-overlap") a.overlap = false;
             else if (arg == "--scheduler") a.scheduler = next();
+            else if (arg == "--plan-from-counts") a.from_counts = true;
             else if (arg == "--random-plan") a.random_plan = std::atoll(next());
             else if (arg == "--trace") a.trace = next();
             else throw std::invalid_argument("unknown argument " + arg);

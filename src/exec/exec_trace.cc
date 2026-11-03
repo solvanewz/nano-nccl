@@ -8,7 +8,7 @@
 namespace nano_nccl::exec {
 
 OpKind parse_op_kind(const std::string& name) {
-    for (int k = 0; k <= static_cast<int>(OpKind::kRetire); ++k) {
+    for (int k = 0; k <= static_cast<int>(OpKind::kPack); ++k) {
         if (name == op_kind_name(static_cast<OpKind>(k))) return static_cast<OpKind>(k);
     }
     throw std::invalid_argument("unknown op kind '" + name + "'");
@@ -21,6 +21,7 @@ std::string LayerTrace::serialize() const {
     o << "key " << key.to_string() << "\n";
     o << "options overlap=" << (options.overlap ? 1 : 0) << " lookahead=" << options.lookahead << " iters=" << iters
       << "\n";
+    o << "plan timing=" << plan_timing_name(timing) << " scheduler=" << planner::scheduler_name(scheduler) << "\n";
     o << "expert_group";
     for (int g : groups.expert_group) o << " " << g;
     o << "\norder";
@@ -78,6 +79,12 @@ LayerTrace LayerTrace::parse(const std::string& text, const std::string& where) 
             t.options.overlap = field(ls, "overlap") != 0;
             t.options.lookahead = static_cast<int>(field(ls, "lookahead"));
             t.iters = static_cast<int>(field(ls, "iters"));
+        } else if (word == "plan") {
+            std::string item;
+            if (!(ls >> item) || item.rfind("timing=", 0) != 0) fail("expected timing=");
+            t.timing = parse_plan_timing(item.substr(7));
+            if (!(ls >> item) || item.rfind("scheduler=", 0) != 0) fail("expected scheduler=");
+            t.scheduler = planner::parse_scheduler(item.substr(10));
         } else if (word == "expert_group" || word == "order") {
             std::vector<int>& v = word == "order" ? t.groups.order : t.groups.expert_group;
             for (int g; ls >> g;) v.push_back(g);

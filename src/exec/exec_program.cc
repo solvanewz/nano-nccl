@@ -22,6 +22,7 @@ Queue queue_of(OpKind kind) {
         case OpKind::kDispatch:
         case OpKind::kCombine: return Queue::kExchange;
         case OpKind::kRoute:
+        case OpKind::kPack:
         case OpKind::kExpert:
         case OpKind::kReduce: return Queue::kStream;
     }
@@ -42,8 +43,56 @@ const char* op_kind_name(OpKind kind) {
         case OpKind::kCombine: return "combine";
         case OpKind::kReduce: return "reduce";
         case OpKind::kRetire: return "retire";
+        case OpKind::kPack: return "pack";
     }
     return "?";
+}
+
+const char* plan_timing_name(PlanTiming timing) {
+    switch (timing) {
+        case PlanTiming::kAhead: return "ahead";
+        case PlanTiming::kFromCounts: return "from_counts";
+    }
+    return "?";
+}
+
+PlanTiming parse_plan_timing(const std::string& name) {
+    for (PlanTiming t : {PlanTiming::kAhead, PlanTiming::kFromCounts}) {
+        if (name == plan_timing_name(t)) return t;
+    }
+    throw std::invalid_argument("unknown plan timing '" + name + "' (known: ahead, from_counts)");
+}
+
+PlanSource PlanSource::ahead(planner::GroupPlan plan) {
+    PlanSource s;
+    s.timing = PlanTiming::kAhead;
+    s.plan = std::move(plan);
+    return s;
+}
+
+PlanSource PlanSource::from_counts(planner::SchedulerKind scheduler, int groups) {
+    if (groups < 1) throw std::invalid_argument("PlanSource::from_counts: groups must be positive");
+    PlanSource s;
+    s.timing = PlanTiming::kFromCounts;
+    s.scheduler = scheduler;
+    s.groups = groups;
+    return s;
+}
+
+PlanSource plan_source_for(planner::SchedulerKind kind, int world, int num_experts, int groups, bool from_counts) {
+    if (from_counts || planner::scheduler_reads_counts(kind)) return PlanSource::from_counts(kind, groups);
+    return PlanSource::ahead(planner::make_schedule(kind, {world, num_experts, groups, {}}));
+}
+
+planner::GroupPlan resolve_plan(const PlanSource& source, int world, int num_experts,
+                                const std::vector<std::int64_t>& global_counts) {
+    if (source.timing == PlanTiming::kAhead) {
+        planner::validate_group_plan(source.plan, num_experts);
+        return source.plan;
+    }
+    planner::ScheduleRequest request{world, num_experts, source.groups, {}};
+    if (planner::scheduler_reads_counts(source.scheduler)) request.counts = global_counts;
+    return planner::make_schedule(source.scheduler, request);
 }
 
 const char* queue_name(Queue queue) {
@@ -85,14 +134,18 @@ static_assert(static_cast<int>(Condition::kConsumerReadable) ==
 static_assert(static_cast<int>(Condition::kReceiveSlotsReleased) ==
               static_cast<int>(transport::peer::CompletionEvent::kReceiveSlotsReleased));
 
-LayerProgram build_layer_program(int rank, const std::vector<int>& group_order, const PipelineOptions& options) {
-    const int G = static_cast<int>(group_order.size());
+namespace {
+
+// group_order empty: kFromCounts (groups unknown, -1).
+LayerProgram build(int rank, int G, const std::vector<int>& group_order, const PipelineOptions& options,
+                   PlanTiming timing) {
     if (G < 1) throw std::invalid_argument("build_layer_program: a plan needs at least one group");
     if (options.lookahead < 0) throw std::invalid_argument("build_layer_program: negative lookahead");
     LayerProgram p;
     p.rank = rank;
     p.steps = G;
     p.options = options;
+    p.timing = timing;
     p.dispatch.assign(G, -1);
     p.expert.assign(G, -1);
     p.combine.assign(G, -1);
@@ -102,7 +155,7 @@ LayerProgram build_layer_program(int rank, const std::vector<int>& group_order, 
         op.queue = queue_of(kind);
         op.rank = rank;
         op.step = step;
-        op.group = step >= 0 ? group_order[step] : -1;
+        op.group = step >= 0 && !group_order.empty() ? group_order[step] : -1;
         op.deps = std::move(deps);
         p.ops.push_back(std::move(op));
         return static_cast<int>(p.ops.size()) - 1;
@@ -110,8 +163,11 @@ LayerProgram build_layer_program(int rank, const std::vector<int>& group_order, 
     p.route = add(OpKind::kRoute, -1, {});
     p.counts = add(OpKind::kCounts, -1, {{p.route, Condition::kDone}});
     p.plan = add(OpKind::kPlan, -1, {{p.counts, Condition::kConsumerReadable}});
+    // The rows a dispatch sends: packed by the route (kAhead) or by the pack.
+    if (timing == PlanTiming::kFromCounts) p.pack = add(OpKind::kPack, -1, {{p.plan, Condition::kDone}});
     auto dispatch = [&](int i) {
         std::vector<Completion> deps{{p.plan, Condition::kDone}};
+        if (p.pack >= 0) deps.push_back({p.pack, Condition::kDone});
         if (!options.overlap && i > 0) deps.push_back({p.combine[i - 1], Condition::kConsumerReadable});
         p.dispatch[i] = add(OpKind::kDispatch, i, std::move(deps));
     };
@@ -149,6 +205,21 @@ LayerProgram build_layer_program(int rank, const std::vector<int>& group_order, 
     return p;
 }
 
+}  // namespace
+
+LayerProgram build_layer_program(int rank, const std::vector<int>& group_order, const PipelineOptions& options) {
+    return build(rank, static_cast<int>(group_order.size()), group_order, options, PlanTiming::kAhead);
+}
+
+LayerProgram build_scheduled_program(int rank, int steps, const PipelineOptions& options) {
+    return build(rank, steps, {}, options, PlanTiming::kFromCounts);
+}
+
+LayerProgram build_program(int rank, const PlanSource& source, const PipelineOptions& options) {
+    if (source.timing == PlanTiming::kAhead) return build_layer_program(rank, source.plan.order, options);
+    return build_scheduled_program(rank, source.groups, options);
+}
+
 void validate_program(const LayerProgram& p) {
     auto fail = [](const std::string& what) { throw std::logic_error("LayerProgram: " + what); };
     const int n = static_cast<int>(p.ops.size());
@@ -182,6 +253,19 @@ void validate_program(const LayerProgram& p) {
     check_role(p.plan, OpKind::kPlan, -1);
     check_role(p.reduce, OpKind::kReduce, -1);
     check_role(p.retire, OpKind::kRetire, -1);
+    if (p.timing == PlanTiming::kFromCounts) {
+        check_role(p.pack, OpKind::kPack, -1);
+        for (int i = 0; i < p.steps; ++i) {
+            bool waits = false;
+            for (const Completion& dep : p.ops[p.dispatch[i]].deps) waits |= dep.op == p.pack;
+            if (!waits) fail("dispatch " + std::to_string(i) + " does not wait for the pack");
+        }
+    } else if (p.pack != -1) {
+        fail("pack op in a kAhead program");
+    }
+    for (int i = 0; i < n; ++i) {
+        if (p.ops[i].kind == OpKind::kPack && i != p.pack) fail("stray pack op");
+    }
     if (static_cast<int>(p.dispatch.size()) != p.steps || static_cast<int>(p.expert.size()) != p.steps ||
         static_cast<int>(p.combine.size()) != p.steps) {
         fail("step role sizes");
@@ -222,18 +306,19 @@ const char* dtype_name(Dtype dtype) {
 
 EpPlan make_ep_plan(const ep::EpShape& shape, const planner::GroupPlan& groups, const PipelineOptions& options,
                     const std::vector<std::int64_t>& send_counts, const std::vector<std::int64_t>& recv_counts,
-                    std::size_t slot_bytes) {
+                    std::size_t slot_bytes, PlanTiming timing) {
     if (options.lookahead < 0) throw std::invalid_argument("make_ep_plan: negative lookahead");
     if (slot_bytes == 0) throw std::invalid_argument("make_ep_plan: zero slot size");
     EpPlan plan;
     plan.shape = shape;
     plan.groups = groups;
     plan.options = options;
+    plan.timing = timing;
     plan.rows = ep::make_dispatch_plan(shape, groups, send_counts, recv_counts);
     BufferNeeds& b = plan.buffers;
     b.send_rows = plan.rows.send_rows;
     b.recv_rows = plan.rows.recv_rows;
-    b.counts_bytes = static_cast<std::size_t>(shape.experts_per_rank()) * sizeof(std::uint64_t);
+    b.counts_bytes = counts_per_peer(shape, timing) * sizeof(std::uint64_t);
     b.max_message_bytes = b.counts_bytes;
     b.max_chunks_per_link = transport::peer::chunk_count(b.counts_bytes, slot_bytes);
     for (const ep::GroupStep& st : plan.rows.steps) {
@@ -257,9 +342,12 @@ std::uint32_t exchange_tag(const LayerProgram& program, int op) {
     }
 }
 
-transport::peer::ExchangeLayout counts_layout(const ep::EpShape& shape) {
-    return transport::peer::uniform_layout(shape.world,
-                                           static_cast<std::size_t>(shape.experts_per_rank()) * sizeof(std::uint64_t));
+std::size_t counts_per_peer(const ep::EpShape& shape, PlanTiming timing) {
+    return static_cast<std::size_t>(timing == PlanTiming::kAhead ? shape.experts_per_rank() : shape.num_experts);
+}
+
+transport::peer::ExchangeLayout counts_layout(const ep::EpShape& shape, PlanTiming timing) {
+    return transport::peer::uniform_layout(shape.world, counts_per_peer(shape, timing) * sizeof(std::uint64_t));
 }
 
 const transport::peer::ExchangeLayout& exchange_layout(const LayerProgram& program, int op, const EpPlan& plan) {
@@ -273,7 +361,8 @@ std::vector<Message> outgoing_messages(const LayerProgram& program, int op, cons
                                        std::uint64_t iteration) {
     const Operation& o = program.ops.at(op);
     const bool counts = o.kind == OpKind::kCounts;
-    const transport::peer::ExchangeLayout layout = counts ? counts_layout(plan.shape) : exchange_layout(program, op, plan);
+    const transport::peer::ExchangeLayout layout =
+        counts ? counts_layout(plan.shape, program.timing) : exchange_layout(program, op, plan);
     std::vector<Message> out;
     for (int peer = 0; peer < plan.shape.world; ++peer) {
         Message m;
@@ -293,7 +382,11 @@ ComputeWork compute_work(const LayerProgram& program, int op, const EpPlan& plan
     const Operation& o = program.ops.at(op);
     ComputeWork w;
     switch (o.kind) {
-        case OpKind::kRoute: w.entries = static_cast<std::int64_t>(tokens) * plan.shape.top_k; break;
+        case OpKind::kRoute:
+            w.entries = static_cast<std::int64_t>(tokens) * plan.shape.top_k;
+            w.route_packs = program.timing == PlanTiming::kAhead;
+            break;
+        case OpKind::kPack: w.entries = static_cast<std::int64_t>(tokens) * plan.shape.top_k; break;
         case OpKind::kReduce: w.tokens = tokens; break;
         case OpKind::kExpert: {
             const ep::GroupStep& st = plan.rows.steps.at(o.step);

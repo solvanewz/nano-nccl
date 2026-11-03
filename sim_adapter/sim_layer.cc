@@ -25,7 +25,9 @@ std::byte* fake_buffer(std::uintptr_t base) { return reinterpret_cast<std::byte*
 
 double gpu_cost(const CostProfile& p, const std::string& mode, OpKind kind, const exec::ComputeWork& w) {
     switch (kind) {
-        case OpKind::kRoute: return p.table(cost::kRoute)(static_cast<double>(w.entries));
+        case OpKind::kRoute:
+            return p.table(w.route_packs ? cost::kRoute : cost::kCount)(static_cast<double>(w.entries));
+        case OpKind::kPack: return p.table(cost::kPack)(static_cast<double>(w.entries));
         case OpKind::kReduce: return p.table(cost::kReduce)(static_cast<double>(w.tokens));
         case OpKind::kExpert: {
             double t = 2 * p.table(cost::kPermute)(static_cast<double>(w.permute_rows));
@@ -63,6 +65,7 @@ public:
             if (static_cast<int>(row.size()) != c.num_experts) {
                 throw std::invalid_argument("simulate_layer: counts rows need num_experts entries");
             }
+            global_counts_.insert(global_counts_.end(), row.begin(), row.end());
         }
         std::vector<WireCosts> wc;
         for (int r = 0; r < W; ++r) {
@@ -81,7 +84,7 @@ public:
             Rank& k = ranks_[r];
             k.shape = ep::EpShape{W, r, c.num_experts, c.top_k, c.hidden, c.ffn};
             ep::validate_shape(k.shape);
-            k.result.program = exec::build_layer_program(r, c.groups.order, c.options);
+            k.result.program = exec::build_program(r, c.plan, c.options);
             k.cursor = std::make_unique<exec::ProgramCursor>(k.result.program);
             k.ex = std::make_unique<PeerExchanger>(&fabric_->wire(r));
             const std::size_t n = k.result.program.ops.size();
@@ -90,8 +93,8 @@ public:
             k.ids.assign(n, 0);
             k.done.assign(n, 0);
             k.gpu_finished.assign(n, 0);
-            k.send_counts.assign(static_cast<std::size_t>(c.num_experts), 0);
-            k.recv_counts.assign(static_cast<std::size_t>(c.num_experts), 0);
+            k.send_counts.assign(static_cast<std::size_t>(W) * c.num_experts, 0);
+            k.recv_counts.assign(static_cast<std::size_t>(W) * c.num_experts, 0);
         }
     }
 
@@ -258,14 +261,19 @@ private:
         const exec::Operation& o = prog.ops[op];
         switch (o.kind) {
             case OpKind::kRoute:
-                k.clock += p_.scalar(cost::kHostRouteIssue);
+                k.clock += p_.scalar(prog.timing == exec::PlanTiming::kAhead ? cost::kHostRouteIssue
+                                                                             : cost::kHostCountIssue);
+                gpu(r, op, gpu_cost(p_, c_.mode, o.kind, work(k, op)));
+                break;
+            case OpKind::kPack:
+                k.clock += p_.scalar(cost::kHostPackIssue);
                 gpu(r, op, gpu_cost(p_, c_.mode, o.kind, work(k, op)));
                 break;
             case OpKind::kCounts: {
                 k.clock += p_.scalar(cost::kHostExchangeIssue);
                 k.ids[op] = transport::peer::exchange_counts_async(*k.ex, c_.iteration, k.send_counts.data(),
                                                                    k.recv_counts.data(),
-                                                                   static_cast<std::size_t>(k.shape.experts_per_rank()));
+                                                                   exec::counts_per_peer(k.shape, prog.timing));
                 exec::EpPlan shape_only;
                 shape_only.shape = k.shape;
                 k.result.messages[op] = exec::outgoing_messages(prog, op, shape_only, c_.iteration);
@@ -273,12 +281,19 @@ private:
             }
             case OpKind::kPlan: {
                 k.clock += p_.table(cost::kHostPlan)(prog.steps);
+                if (prog.timing == exec::PlanTiming::kFromCounts) {
+                    k.clock += p_.table(std::string(cost::kHostSchedule) + planner::scheduler_name(c_.plan.scheduler))(
+                        static_cast<double>(c_.num_experts) * prog.steps);
+                }
                 const int epr = k.shape.experts_per_rank();
                 std::vector<std::int64_t> recv(static_cast<std::size_t>(c_.world) * epr);
                 for (int s = 0; s < c_.world; ++s) {
                     for (int j = 0; j < epr; ++j) recv[s * epr + j] = counts_[s][r * epr + j];
                 }
-                k.result.plan = exec::make_ep_plan(k.shape, c_.groups, c_.options, counts_[r], recv, c_.slot_bytes);
+                // The scheduler itself: the same code the runtime's plan op runs.
+                const planner::GroupPlan groups = exec::resolve_plan(c_.plan, c_.world, c_.num_experts, global_counts_);
+                k.result.plan = exec::make_ep_plan(k.shape, groups, c_.options, counts_[r], recv, c_.slot_bytes,
+                                                   prog.timing);
                 k.have_plan = true;
                 break;
             }
@@ -315,10 +330,10 @@ private:
 
     exec::ComputeWork work(const Rank& k, int op) const {
         const OpKind kind = k.result.program.ops[op].kind;
-        if (kind == OpKind::kRoute) {
-            exec::ComputeWork w;
-            w.entries = static_cast<std::int64_t>(tokens_[k.shape.rank]) * c_.top_k;
-            return w;
+        if (kind == OpKind::kRoute || kind == OpKind::kPack) {  // may run before the plan exists
+            exec::EpPlan shape_only;
+            shape_only.shape = k.shape;
+            return exec::compute_work(k.result.program, op, shape_only, tokens_[k.shape.rank]);
         }
         return exec::compute_work(k.result.program, op, k.result.plan, tokens_[k.shape.rank]);
     }
@@ -389,6 +404,7 @@ private:
 
     const SimLayerConfig& c_;
     const std::vector<std::vector<std::int64_t>>& counts_;
+    std::vector<std::int64_t> global_counts_;  // N(s, e) at s * E + e
     const std::vector<int>& tokens_;
     const CostProfile& p_;
     double host_poll_ = 0, launch_latency_ = 0;
@@ -403,7 +419,9 @@ private:
 LayerSimulation::LayerSimulation(const SimLayerConfig& config, const std::vector<std::vector<std::int64_t>>& counts,
                                  const std::vector<int>& tokens, const CostProfile& profile, Scheduler& scheduler,
                                  const FabricFactory& fabric) {
-    planner::validate_group_plan(config.groups, config.num_experts);
+    if (config.plan.timing == exec::PlanTiming::kAhead) {
+        planner::validate_group_plan(config.plan.plan, config.num_experts);
+    }
     impl_ = std::make_unique<Impl>(config, counts, tokens, profile, scheduler, fabric);
 }
 
@@ -412,22 +430,6 @@ LayerSimulation::~LayerSimulation() = default;
 void LayerSimulation::start(std::function<void()> on_all_retired) { impl_->start(std::move(on_all_retired)); }
 
 SimResult LayerSimulation::finish(std::uint64_t events) { return impl_->finish(events); }
-
-planner::GroupPlan schedule_groups(planner::SchedulerKind kind, int world, int num_experts, int groups,
-                                   const std::vector<std::vector<std::int64_t>>& counts) {
-    planner::ScheduleRequest request{world, num_experts, groups, {}};
-    if (static_cast<int>(counts.size()) != world) {
-        throw std::invalid_argument("schedule_groups: counts has " + std::to_string(counts.size()) + " ranks");
-    }
-    for (const auto& row : counts) {
-        if (static_cast<int>(row.size()) != num_experts) {
-            throw std::invalid_argument("schedule_groups: a counts row has " + std::to_string(row.size()) +
-                                        " experts");
-        }
-        request.counts.insert(request.counts.end(), row.begin(), row.end());
-    }
-    return planner::make_schedule(kind, request);
-}
 
 SimResult simulate_layer(const SimLayerConfig& config, const std::vector<std::vector<std::int64_t>>& counts,
                          const std::vector<int>& tokens, const CostProfile& profile) {

@@ -172,6 +172,7 @@ struct Args {
     int world = 2, experts = 16, top_k = 2, hidden = 2048, ffn = 1408, tokens = 4096;
     double skew = 0.0;
     std::string scheduler = "fixed";
+    bool from_counts = false;
     int groups = 1, lookahead = 1;
     bool overlap = true;
     int slots = 4;
@@ -317,7 +318,7 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
         c.hidden = k.hidden;
         c.ffn = k.ffn;
         c.mode = k.mode;
-        c.groups = trace.groups;
+        c.plan = trace.source();
         c.options = trace.options;
         c.slots_per_link = k.slots_per_link;
         c.slot_bytes = k.slot_bytes;
@@ -343,8 +344,8 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
                 nano_nccl::ep::make_routing(s, a.tokens, a.skew, -1, nano_nccl::ep::benchmark_routing_seed(r)).ids,
                 a.experts));
         }
-        c.groups = nsim::schedule_groups(nano_nccl::planner::parse_scheduler(a.scheduler), a.world, a.experts,
-                                         a.groups, counts);
+        c.plan = nano_nccl::exec::plan_source_for(nano_nccl::planner::parse_scheduler(a.scheduler), a.world,
+                                                  a.experts, a.groups, a.from_counts);
     }
     auto factory = [&](nsim::Scheduler& s, nsim::HostModel& host, int world, int slots, std::size_t slot_bytes,
                        std::vector<nsim::WireCosts> costs) -> std::unique_ptr<nsim::Fabric> {
@@ -402,6 +403,7 @@ int main(int argc, char** argv) {
             else if (arg == "--tokens") a.tokens = std::atoi(next());
             else if (arg == "--skew") a.skew = std::atof(next());
             else if (arg == "--scheduler") a.scheduler = next();
+            else if (arg == "--plan-from-counts") a.from_counts = true;
             else if (arg == "--groups") a.groups = std::atoi(next());
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());
             else if (arg == "--no-overlap") a.overlap = false;

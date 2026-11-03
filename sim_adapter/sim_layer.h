@@ -2,7 +2,6 @@
 
 #include "cost_profile.h"
 #include "exec/exec_program.h"
-#include "planner/scheduler.h"
 #include "sim_wire.h"
 
 #include <cstdint>
@@ -29,7 +28,9 @@ struct SimLayerConfig {
     int hidden = 0;
     int ffn = 0;
     std::string mode = "ffn";  // ffn | probe: which expert cost table applies
-    planner::GroupPlan groups;
+    // kAhead: the plan; kFromCounts: each rank's plan op runs the scheduler on
+    // the true global counts (what the all-gather of the counts delivers).
+    exec::PlanSource plan;
     exec::PipelineOptions options;
     int slots_per_link = 4;
     std::size_t slot_bytes = std::size_t{1} << 20;
@@ -106,11 +107,6 @@ private:
 // SimFabric. Throws std::runtime_error on deadlock.
 SimResult simulate_layer(const SimLayerConfig& config, const std::vector<std::vector<std::int64_t>>& counts,
                          const std::vector<int>& tokens, const CostProfile& profile);
-
-// The scheduler switch on the simulator side: the GroupPlan that every rank
-// derives from counts[r][e] = N(r, e) with planner::make_schedule().
-planner::GroupPlan schedule_groups(planner::SchedulerKind kind, int world, int num_experts, int groups,
-                                   const std::vector<std::vector<std::int64_t>>& counts);
 
 // GPU duration of an op under the profile (exposed for reports and tests).
 double gpu_cost(const CostProfile& profile, const std::string& mode, exec::OpKind kind, const exec::ComputeWork& work);

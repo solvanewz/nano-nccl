@@ -38,6 +38,7 @@ namespace {
 using nano_nccl::exec::Condition;
 using nano_nccl::exec::LayerProgram;
 using nano_nccl::exec::OpKind;
+using nano_nccl::exec::PlanSource;
 using nano_nccl::exec::Queue;
 using nano_nccl::sim::CostProfile;
 using nano_nccl::sim::EventQueue;
@@ -84,7 +85,12 @@ CostProfile synthetic_profile(bool contention = false) {
     t(cost::kRxSelf, {{4096, 0.5}, {1 << 20, 4}});
     t(cost::kHostExpertIssue, {{0, 5}, {8, 40}});
     t(cost::kHostPlan, {{1, 10}, {8, 30}});
+    t(cost::kCount, {{0, 2}, {100000, 22}});
+    t(cost::kPack, {{0, 4}, {100000, 90}});
+    t("host_schedule_us_fixed", {{1, 1}});
+    t("host_schedule_us_token_greedy", {{1, 2}, {1000, 40}});
     p.scalars = {{cost::kHostRouteIssue, 10}, {cost::kHostReduceIssue, 3}, {cost::kHostExchangeIssue, 1},
+                 {cost::kHostCountIssue, 4},  {cost::kHostPackIssue, 7},
                  {cost::kHostPost, 2},        {cost::kHostCopyOut, 2},     {cost::kHostPoll, 0.5},
                  {cost::kLaunchLatency, 4},   {cost::kCopyLatency, 2},     {cost::kCreditLatency, 0.2},
                  {cost::kArrivalLatency, 0.2}};
@@ -112,7 +118,7 @@ Case balanced_case(int world, int epr, int rows_per_expert, int hidden) {
     s.top_k = 2;
     s.hidden = hidden;
     s.ffn = 512;
-    s.groups = nano_nccl::planner::fixed_group_plan(world, s.num_experts, 1);
+    s.plan = PlanSource::ahead(nano_nccl::planner::fixed_group_plan(world, s.num_experts, 1));
     s.options = {false, 0};
     s.slots_per_link = 4;
     s.slot_bytes = 65536;
@@ -177,7 +183,7 @@ void check_invariants(const Case& c, const SimResult& res, const CostProfile& pr
                 const auto& dst_plan = res.ranks[m.dst].plan;
                 const std::size_t expect =
                     prog.ops[i].kind == OpKind::kCounts
-                        ? nano_nccl::exec::counts_layout(dst_plan.shape).recv_bytes[r]
+                        ? nano_nccl::exec::counts_layout(dst_plan.shape, prog.timing).recv_bytes[r]
                         : nano_nccl::exec::exchange_layout(res.ranks[m.dst].program, static_cast<int>(i), dst_plan)
                               .recv_bytes[r];
                 require(m.src == r && m.bytes == expect, "message " + std::to_string(r) + "->" +
@@ -212,6 +218,25 @@ void check_invariants(const Case& c, const SimResult& res, const CostProfile& pr
     }
     for (const auto& l : res.links) {
         require(l.max_in_flight <= static_cast<std::uint32_t>(c.config.slots_per_link), "more chunks in flight than slots");
+    }
+    // One plan per invocation on every rank; with kFromCounts, the scheduler's
+    // plan for the global counts, and no row leaves before it is packed.
+    for (int r = 0; r < W; ++r) {
+        const auto& rr = res.ranks[r];
+        require(rr.plan.groups.expert_group == res.ranks[0].plan.groups.expert_group &&
+                    rr.plan.groups.order == res.ranks[0].plan.groups.order,
+                "ranks ran different plans");
+        if (rr.program.timing != nano_nccl::exec::PlanTiming::kFromCounts) continue;
+        std::vector<std::int64_t> global;
+        for (const auto& row : c.counts) global.insert(global.end(), row.begin(), row.end());
+        const auto want = nano_nccl::exec::resolve_plan(c.config.plan, W, c.config.num_experts, global);
+        require(rr.plan.groups.expert_group == want.expert_group && rr.plan.groups.order == want.order,
+                "plan is not the scheduler's plan for the global counts");
+        const double packed = rr.ops[rr.program.pack].gpu_end;
+        require(rr.ops[rr.program.pack].gpu_start >= rr.ops[rr.program.plan].issue_end - 1e-9, "pack before the plan");
+        for (int d : rr.program.dispatch) {
+            require(rr.ops[d].issue_begin >= packed - 1e-9, "dispatch issued before the rows were packed");
+        }
     }
 }
 
@@ -259,6 +284,35 @@ void test_program() {
             }
         }
     }
+    // kFromCounts: the same exchange order as kAhead with as many steps, the
+    // pack between the plan and every dispatch, and no group known yet.
+    for (int G = 1; G <= 6; ++G) {
+        for (int L = 0; L <= 6; ++L) {
+            for (bool overlap : {false, true}) {
+                std::vector<int> order(G);
+                std::iota(order.begin(), order.end(), 0);
+                const LayerProgram a = nano_nccl::exec::build_layer_program(1, order, {overlap, L});
+                const LayerProgram f = nano_nccl::exec::build_scheduled_program(1, G, {overlap, L});
+                require(f.timing == nano_nccl::exec::PlanTiming::kFromCounts && a.pack == -1, "timing roles");
+                std::vector<std::pair<OpKind, int>> ea, ef;
+                for (const auto& op : a.ops) {
+                    if (op.queue == Queue::kExchange) ea.push_back({op.kind, op.step});
+                }
+                for (const auto& op : f.ops) {
+                    if (op.queue == Queue::kExchange) ef.push_back({op.kind, op.step});
+                    if (op.step >= 0) require(op.group == -1, "scheduled program knows a group");
+                }
+                require(ea == ef, "kFromCounts changes the exchange order");
+                require(f.route < f.counts && f.counts < f.plan && f.plan < f.pack && f.pack < f.dispatch[0],
+                        "kFromCounts op order");
+                for (int i = 0; i < G; ++i) {
+                    bool waits = false;
+                    for (const auto& d : f.ops[f.dispatch[i]].deps) waits |= d.op == f.pack;
+                    require(waits, "dispatch does not wait for the pack");
+                }
+            }
+        }
+    }
     bool threw = false;
     try {
         nano_nccl::exec::build_layer_program(0, {0}, {true, -1});
@@ -297,6 +351,19 @@ void test_formats() {
     }
     const auto back = nano_nccl::exec::LayerTrace::parse(tr.serialize());
     require(back.serialize() == tr.serialize(), "trace round trip");
+    tr.timing = nano_nccl::exec::PlanTiming::kFromCounts;
+    tr.scheduler = nano_nccl::planner::SchedulerKind::kTokenGreedy;
+    const auto back2 = nano_nccl::exec::LayerTrace::parse(tr.serialize());
+    require(back2.serialize() == tr.serialize() && back2.timing == tr.timing && back2.scheduler == tr.scheduler,
+            "trace round trip with a scheduled plan");
+    require(back2.source().timing == nano_nccl::exec::PlanTiming::kFromCounts && back2.source().groups == 2,
+            "trace source");
+    std::string old = tr.serialize();  // traces written before the plan line: kAhead, fixed
+    old.erase(old.find("plan timing="), old.find('\n', old.find("plan timing=")) - old.find("plan timing=") + 1);
+    const auto back3 = nano_nccl::exec::LayerTrace::parse(old);
+    require(back3.timing == nano_nccl::exec::PlanTiming::kAhead &&
+                back3.scheduler == nano_nccl::planner::SchedulerKind::kFixed,
+            "trace without a plan line");
     bool threw = false;
     try {
         nano_nccl::exec::ProfileKey::parse("world=2 bogus=1");
@@ -320,14 +387,23 @@ void test_random(int trials) {
         s.hidden = 8 * (1 + static_cast<int>(rng() % 64));
         s.ffn = 64;
         s.mode = rng() % 2 ? "ffn" : "probe";
-        if (rng() % 2) {
-            s.groups = nano_nccl::planner::fixed_group_plan(s.world, s.num_experts, 1 + static_cast<int>(rng() % epr));
-        } else {
+        const int pick = static_cast<int>(rng() % 4);
+        if (pick == 0) {
+            s.plan = PlanSource::ahead(
+                nano_nccl::planner::fixed_group_plan(s.world, s.num_experts, 1 + static_cast<int>(rng() % epr)));
+        } else if (pick == 1) {
+            nano_nccl::planner::GroupPlan g;
             const int G = 1 + static_cast<int>(rng() % (s.num_experts + 1));
-            for (int e = 0; e < s.num_experts; ++e) s.groups.expert_group.push_back(static_cast<int>(rng() % G));
-            s.groups.order.resize(G);
-            std::iota(s.groups.order.begin(), s.groups.order.end(), 0);
-            std::shuffle(s.groups.order.begin(), s.groups.order.end(), rng);
+            for (int e = 0; e < s.num_experts; ++e) g.expert_group.push_back(static_cast<int>(rng() % G));
+            g.order.resize(G);
+            std::iota(g.order.begin(), g.order.end(), 0);
+            std::shuffle(g.order.begin(), g.order.end(), rng);
+            s.plan = PlanSource::ahead(g);
+        } else if (pick == 2) {
+            s.plan = PlanSource::from_counts(nano_nccl::planner::SchedulerKind::kTokenGreedy,
+                                             1 + static_cast<int>(rng() % s.num_experts));
+        } else {
+            s.plan = PlanSource::from_counts(nano_nccl::planner::SchedulerKind::kFixed, 1 + static_cast<int>(rng() % epr));
         }
         s.options = {rng() % 3 != 0, static_cast<int>(rng() % 5)};
         s.slots_per_link = 1 + static_cast<int>(rng() % 4);
@@ -343,11 +419,61 @@ void test_random(int trials) {
             check_invariants(c, run(c, prof), prof);
         } catch (const std::exception& e) {
             throw std::runtime_error("trial " + std::to_string(t) + " (W=" + std::to_string(s.world) +
-                                     " groups=" + std::to_string(s.groups.groups()) + " slots=" +
+                                     " groups=" + std::to_string(s.plan.steps()) + " timing=" +
+                                     nano_nccl::exec::plan_timing_name(s.plan.timing) + " slots=" +
                                      std::to_string(s.slots_per_link) + " slot_bytes=" + std::to_string(s.slot_bytes) +
                                      "): " + e.what());
         }
     }
+}
+
+// kFromCounts end to end: counts carry full rows, the fixed scheduler gives
+// the kAhead plan at a measurable extra cost, token_greedy runs at the plan op.
+void test_plan_from_counts() {
+    const CostProfile prof = synthetic_profile();
+    Case c = balanced_case(2, 4, 64, 256);
+    // Rank 0's experts 0 and 1 are hot, rank 1's experts 6 and 7.
+    for (int r = 0; r < 2; ++r) c.counts[r] = {400, 300, 10, 10, 10, 10, 300, 400};
+    for (int r = 0; r < 2; ++r) c.tokens[r] = 1440 / 2;
+    c.config.options = {true, 1};
+    const auto fixed = nano_nccl::planner::fixed_group_plan(2, 8, 2);
+    c.config.plan = PlanSource::ahead(fixed);
+    const SimResult ahead = run(c, prof);
+    check_invariants(c, ahead, prof);
+    c.config.plan = PlanSource::from_counts(nano_nccl::planner::SchedulerKind::kFixed, 2);
+    const SimResult dyn_fixed = run(c, prof);
+    check_invariants(c, dyn_fixed, prof);
+    for (int r = 0; r < 2; ++r) {
+        const auto& a = ahead.ranks[r];
+        const auto& f = dyn_fixed.ranks[r];
+        require(f.plan.groups.expert_group == fixed.expert_group && f.plan.groups.order == fixed.order,
+                "fixed from counts gives another plan");
+        for (const auto& m : a.messages[a.program.counts]) require(m.bytes == 4 * 8, "kAhead counts message size");
+        for (const auto& m : f.messages[f.program.counts]) require(m.bytes == 8 * 8, "kFromCounts counts message size");
+    }
+    require(dyn_fixed.makespan > ahead.makespan, "the dynamic program's cost does not show");
+    // Op costs: no copy runs during the route or the pack, so they take
+    // their profiled time exactly; the plan op adds the scheduler's time.
+    const double entries = static_cast<double>(c.tokens[0]) * c.config.top_k;
+    auto near = [](double a, double b) { return std::abs(a - b) < 1e-6; };
+    const auto& ar = ahead.ranks[0];
+    const auto& fr = dyn_fixed.ranks[0];
+    const auto dur = [](const nano_nccl::sim::SimOpTimes& t) { return t.gpu_end - t.gpu_start; };
+    require(near(dur(ar.ops[ar.program.route]), prof.table(cost::kRoute)(entries)), "kAhead route cost");
+    require(near(dur(fr.ops[fr.program.route]), prof.table(cost::kCount)(entries)), "kFromCounts route cost");
+    require(near(dur(fr.ops[fr.program.pack]), prof.table(cost::kPack)(entries)), "pack cost");
+    const auto& plan_op = fr.ops[fr.program.plan];
+    require(near(plan_op.issue_end - plan_op.issue_begin,
+                 prof.table(cost::kHostPlan)(2) + prof.table("host_schedule_us_fixed")(8 * 2)),
+            "plan op cost without the scheduler's time");
+    c.config.plan = PlanSource::from_counts(nano_nccl::planner::SchedulerKind::kTokenGreedy, 2);
+    const SimResult greedy = run(c, prof);
+    check_invariants(c, greedy, prof);
+    // Both hot pairs share a step, as the scheduler decides on these counts.
+    const auto& g = greedy.ranks[0].plan.groups;
+    require(g.expert_group[0] == g.expert_group[7] && g.expert_group[1] == g.expert_group[6] &&
+                g.expert_group[0] != g.expert_group[1],
+            "token_greedy plan in the simulator");
 }
 
 double expert_launch(const SimResult& r, int rank, int step) {
@@ -359,7 +485,7 @@ void test_timing() {
     // Communication and computation of similar size: W=2, 4 experts/rank,
     // 512 rows each, 1 KiB rows -> 2 MiB per peer per layer.
     Case base = balanced_case(2, 4, 512, 512);
-    base.config.groups = nano_nccl::planner::fixed_group_plan(2, 8, 4);
+    base.config.plan = PlanSource::ahead(nano_nccl::planner::fixed_group_plan(2, 8, 4));
     base.config.options = {true, 1};
     const SimResult r0 = run(base, prof);
     check_invariants(base, r0, prof);
@@ -418,7 +544,7 @@ void test_timing() {
     }
     // Overlap beats serial when communication and computation are comparable.
     Case one = base;
-    one.config.groups = nano_nccl::planner::fixed_group_plan(2, 8, 1);
+    one.config.plan = PlanSource::ahead(nano_nccl::planner::fixed_group_plan(2, 8, 1));
     one.config.options = {false, 0};
     const SimResult r_one = run(one, prof);
     Case over = base;
@@ -520,7 +646,7 @@ void test_fluid() {
     CostProfile quiet = p;
     quiet.scalars[std::string(cost::kGpuCopySlowdown) + "@0"] = 1.0;
     Case c = balanced_case(2, 4, 512, 512);
-    c.config.groups = nano_nccl::planner::fixed_group_plan(2, 8, 4);
+    c.config.plan = PlanSource::ahead(nano_nccl::planner::fixed_group_plan(2, 8, 4));
     c.config.options = {true, 3};
     const SimResult slow = run(c, p), base = run(c, quiet);
     check_invariants(c, slow, p);
@@ -537,6 +663,7 @@ int main() {
     check("program_structure", test_program);
     check("formats", test_formats);
     check("random_worlds_invariants", [] { test_random(400); });
+    check("plan_from_counts", test_plan_from_counts);
     check("timing_dependencies", test_timing);
     check("insitu_copy_model", test_fluid);
     std::printf("sim_adapter=%s\n", g_failed == 0 ? "PASS" : "FAIL");

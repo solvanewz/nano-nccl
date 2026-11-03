@@ -6,13 +6,14 @@
 //       counts, group plan, options and slots; prints measured vs predicted
 //       stage times and, with --timeline, rank 0's per-op times.
 //   nano_ep_sim --profile P [--world W --experts E --topk K --hidden H --ffn-dim F
-//               --tokens T --skew S --scheduler NAME --groups G --lookahead L
-//               --no-overlap --slots N --slot-bytes B --mode ffn|probe --sweep
-//               --timeline]
+//               --tokens T --skew S --scheduler NAME --plan-from-counts --groups G
+//               --lookahead L --no-overlap --slots N --slot-bytes B
+//               --mode ffn|probe --sweep --timeline]
 //       synthetic routing (ep::make_routing with the benchmark seeds), one
 //       configuration or, with --sweep, the A40 benchmark sweep. The group
 //       plan comes from the scheduler switch (planner::make_schedule, default
-//       fixed = B1) with G groups.
+//       fixed = B1) with G groups (exec::plan_source_for: schedulers that read
+//       the counts, or any with --plan-from-counts, run at the plan op).
 #include "cost_profile.h"
 #include "ep/synthetic_routing.h"
 #include "exec/exec_trace.h"
@@ -105,6 +106,7 @@ struct Args {
     int world = 2, experts = 16, top_k = 2, hidden = 2048, ffn = 1408, tokens = 4096;
     double skew = 0.0;
     std::string scheduler = "fixed";
+    bool from_counts = false;
     int groups = 1, lookahead = 1;
     bool overlap = true, sweep = false, timeline = false;
     int slots = 4;
@@ -128,7 +130,7 @@ int replay(const Args& a, const nano_nccl::sim::CostProfile& profile) {
     c.hidden = k.hidden;
     c.ffn = k.ffn;
     c.mode = k.mode;
-    c.groups = trace.groups;
+    c.plan = trace.source();
     c.options = trace.options;
     c.slots_per_link = k.slots_per_link;
     c.slot_bytes = k.slot_bytes;
@@ -142,12 +144,21 @@ int replay(const Args& a, const nano_nccl::sim::CostProfile& profile) {
         tokens.push_back(r.tokens);
     }
     const SimResult res = nano_nccl::sim::simulate_layer(c, counts, tokens, profile);
+    // A scheduled run: the simulator's scheduler call must give the plan the
+    // runtime ran.
+    for (const auto& r : res.ranks) {
+        if (r.plan.groups.expert_group != trace.groups.expert_group || r.plan.groups.order != trace.groups.order) {
+            throw std::runtime_error("replay: the simulated plan differs from the measured one");
+        }
+    }
     std::vector<Stages> pred, meas;
     for (const auto& r : res.ranks) pred.push_back(stages_of(r));
     for (const auto& r : trace.ranks) meas.push_back({r.route, r.counts, r.pipeline, r.reduce, r.total});
     const Stages p = slowest(pred), m = slowest(meas);
-    std::printf("# replay of %s\n# key %s\n# groups=%d overlap=%d lookahead=%d\n", a.trace.c_str(),
-                k.to_string().c_str(), trace.groups.groups(), trace.options.overlap ? 1 : 0, trace.options.lookahead);
+    std::printf("# replay of %s\n# key %s\n# plan=%s scheduler=%s groups=%d overlap=%d lookahead=%d\n",
+                a.trace.c_str(), k.to_string().c_str(), nano_nccl::exec::plan_timing_name(trace.timing),
+                nano_nccl::planner::scheduler_name(trace.scheduler), trace.groups.groups(),
+                trace.options.overlap ? 1 : 0, trace.options.lookahead);
     std::printf("  %-9s %10s %10s %8s\n", "stage", "measured", "predicted", "error");
     const char* names[] = {"route", "counts", "pipeline", "reduce", "total"};
     const double mv[] = {m.route, m.counts, m.pipeline, m.reduce, m.total};
@@ -157,8 +168,9 @@ int replay(const Args& a, const nano_nccl::sim::CostProfile& profile) {
     }
     print_utilization(res);
     if (a.timeline) print_timeline(res, 0, &trace);
-    std::printf("compare groups=%d overlap=%d lookahead=%d skew=%g contention=%d measured=%.1f predicted=%.1f "
-                "error=%.1f%%\n",
+    std::printf("compare scheduler=%s plan=%s groups=%d overlap=%d lookahead=%d skew=%g contention=%d measured=%.1f "
+                "predicted=%.1f error=%.1f%%\n",
+                nano_nccl::planner::scheduler_name(trace.scheduler), nano_nccl::exec::plan_timing_name(trace.timing),
                 trace.groups.groups(), trace.options.overlap ? 1 : 0, trace.options.lookahead, k.skew,
                 a.contention ? 1 : 0, m.total, p.total, 100 * (p.total - m.total) / m.total);
     return 0;
@@ -181,8 +193,8 @@ double synthetic(const Args& a, const nano_nccl::sim::CostProfile& profile, int 
             nano_nccl::ep::make_routing(s, a.tokens, a.skew, -1, nano_nccl::ep::benchmark_routing_seed(r)).ids,
             a.experts));
     }
-    c.groups = nano_nccl::sim::schedule_groups(nano_nccl::planner::parse_scheduler(a.scheduler), a.world, a.experts,
-                                               groups, counts);
+    c.plan = nano_nccl::exec::plan_source_for(nano_nccl::planner::parse_scheduler(a.scheduler), a.world, a.experts,
+                                              groups, a.from_counts);
     c.options = {overlap, lookahead};
     c.slots_per_link = a.slots;
     c.slot_bytes = a.slot_bytes;
@@ -195,9 +207,16 @@ double synthetic(const Args& a, const nano_nccl::sim::CostProfile& profile, int 
     const Stages s = slowest(all);
     if (verbose) {
         std::printf("# simulated: world=%d experts=%d top_k=%d hidden=%d ffn=%d tokens=%d skew=%g scheduler=%s "
-                    "groups=%d overlap=%d lookahead=%d slots=%d slot_bytes=%zu\n",
+                    "plan=%s groups=%d overlap=%d lookahead=%d slots=%d slot_bytes=%zu\n",
                     a.world, a.experts, a.top_k, a.hidden, a.ffn, a.tokens, a.skew, a.scheduler.c_str(),
-                    c.groups.groups(), overlap ? 1 : 0, lookahead, a.slots, a.slot_bytes);
+                    nano_nccl::exec::plan_timing_name(c.plan.timing), c.plan.steps(), overlap ? 1 : 0, lookahead,
+                    a.slots, a.slot_bytes);
+        const auto& ran = res.ranks[0].plan.groups;
+        std::printf("# expert -> group:");
+        for (int g : ran.expert_group) std::printf(" %d", g);
+        std::printf("; order:");
+        for (int g : ran.order) std::printf(" %d", g);
+        std::printf("\n");
         std::printf("  route %.1f  counts %.1f  pipeline %.1f  reduce %.1f  total %.1f (us, slowest rank)\n", s.route,
                     s.counts, s.pipeline, s.reduce, s.total);
         print_utilization(res);
@@ -227,6 +246,7 @@ int main(int argc, char** argv) {
             else if (arg == "--tokens") a.tokens = std::atoi(next());
             else if (arg == "--skew") a.skew = std::atof(next());
             else if (arg == "--scheduler") a.scheduler = next();
+            else if (arg == "--plan-from-counts") a.from_counts = true;
             else if (arg == "--groups") a.groups = std::atoi(next());
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());
             else if (arg == "--no-overlap") a.overlap = false;

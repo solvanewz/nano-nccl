@@ -219,7 +219,7 @@ void test_random(int trials) {
         c.hidden = 256;
         c.ffn = 512;
         const int groups = 1 + static_cast<int>(rng() % epr);  // at most experts per rank
-        c.groups = nano_nccl::planner::fixed_group_plan(c.world, c.num_experts, groups);
+        c.plan = nano_nccl::exec::PlanSource::ahead(nano_nccl::planner::fixed_group_plan(c.world, c.num_experts, groups));
         const bool overlap = rng() % 2 == 0;
         c.options = {overlap, overlap ? static_cast<int>(rng() % 3) : 0};
         c.slots_per_link = 1 + static_cast<int>(rng() % 4);
@@ -258,7 +258,7 @@ void test_timing() {
     c.top_k = 2;
     c.hidden = 1024;
     c.ffn = 512;
-    c.groups = nano_nccl::planner::fixed_group_plan(4, 16, 4);
+    c.plan = nano_nccl::exec::PlanSource::ahead(nano_nccl::planner::fixed_group_plan(4, 16, 4));
     c.options = {true, 1};
     c.slots_per_link = 4;
     c.slot_bytes = 65536;
@@ -287,7 +287,7 @@ void test_credits() {
     c.top_k = 2;
     c.hidden = 256;
     c.ffn = 512;
-    c.groups = nano_nccl::planner::fixed_group_plan(2, 2, 1);
+    c.plan = nano_nccl::exec::PlanSource::ahead(nano_nccl::planner::fixed_group_plan(2, 2, 1));
     c.options = {false, 0};
     c.slots_per_link = 1;
     c.slot_bytes = 4096;
@@ -324,7 +324,7 @@ void test_staged() {
     c.top_k = 2;
     c.hidden = 1024;
     c.ffn = 512;
-    c.groups = nano_nccl::planner::fixed_group_plan(4, 16, 4);
+    c.plan = nano_nccl::exec::PlanSource::ahead(nano_nccl::planner::fixed_group_plan(4, 16, 4));
     c.options = {true, 1};
     c.slots_per_link = 4;
     c.slot_bytes = 65536;

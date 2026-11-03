@@ -2,6 +2,7 @@
 
 #include "ep/ep_plan.h"
 #include "planner/group_plan.h"
+#include "planner/scheduler.h"
 #include "transport/peer/peer_types.h"
 
 #include <cstddef>
@@ -33,15 +34,57 @@ struct PipelineOptions {
     int lookahead = 1;
 };
 
+// When the invocation's GroupPlan is known.
+enum class PlanTiming : int {
+    // Before routing (B1 fixed, test plans): kRoute also places and packs the
+    // rows in plan order, and kCounts carries to each peer only N(rank, e) for
+    // that peer's experts.
+    kAhead = 0,
+    // From this invocation's counts (B2): kRoute only counts; kCounts
+    // all-gathers every rank's full row N(rank, .); kPlan runs the scheduler
+    // on the global N; kPack then places and packs. Everything between the
+    // counts and the first dispatch is the cost of the dynamic plan.
+    kFromCounts,
+};
+const char* plan_timing_name(PlanTiming timing);
+PlanTiming parse_plan_timing(const std::string& name);  // throws std::invalid_argument
+
+// Where an invocation's GroupPlan comes from. Every rank must pass the same
+// source for the same invocation.
+struct PlanSource {
+    PlanTiming timing = PlanTiming::kAhead;
+    planner::GroupPlan plan;  // kAhead
+    // kFromCounts: the scheduler and its group count (= the program's steps;
+    // the scheduler must return exactly that many groups).
+    planner::SchedulerKind scheduler = planner::SchedulerKind::kFixed;
+    int groups = 0;
+
+    static PlanSource ahead(planner::GroupPlan plan);
+    static PlanSource from_counts(planner::SchedulerKind scheduler, int groups);
+    int steps() const { return timing == PlanTiming::kAhead ? plan.groups() : groups; }
+};
+
+// The source front ends use for scheduler `kind` with `groups` groups:
+// kFromCounts when the scheduler reads the counts or `from_counts` is set
+// (e.g. fixed with the dynamic program, to measure that program's cost),
+// else kAhead with make_schedule's plan.
+PlanSource plan_source_for(planner::SchedulerKind kind, int world, int num_experts, int groups, bool from_counts);
+
+// The invocation's plan. kAhead: source.plan (validated); kFromCounts:
+// planner::make_schedule on `global_counts` (N(s, e) at s * E + e).
+planner::GroupPlan resolve_plan(const PlanSource& source, int world, int num_experts,
+                                const std::vector<std::int64_t>& global_counts);
+
 enum class OpKind : int {
-    kRoute = 0,  // count + place + pack kernels, counts copied to the host
-    kCounts,     // exchange of N(s, e)
-    kPlan,       // host: build the EpPlan from the counts, upload its tables
+    kRoute = 0,  // count kernel, counts copied to the host; kAhead: also place + pack
+    kCounts,     // exchange of N(s, e) (see PlanTiming)
+    kPlan,       // host: [kFromCounts: run the scheduler,] build the EpPlan, upload its tables
     kDispatch,   // exchange of one step's token rows
     kExpert,     // unpack -> expert FFN -> repack of one step
     kCombine,    // exchange of one step's expert outputs, back to the sources
     kReduce,     // weighted top-k sum
     kRetire,     // host: every exchange finished; buffers may be reused
+    kPack,       // kFromCounts only: send order upload + place + pack
 };
 const char* op_kind_name(OpKind kind);
 
@@ -89,17 +132,24 @@ struct LayerProgram {
     int rank = 0;
     int steps = 0;
     PipelineOptions options;
+    PlanTiming timing = PlanTiming::kAhead;
     std::vector<Operation> ops;
-    // Op indices by role.
-    int route = -1, counts = -1, plan = -1, reduce = -1, retire = -1;
+    // Op indices by role; pack is -1 for kAhead.
+    int route = -1, counts = -1, plan = -1, pack = -1, reduce = -1, retire = -1;
     std::vector<int> dispatch, expert, combine;  // [steps]
     // Index of each kExchange op among this rank's exchanges, in issue order;
     // -1 for other ops. Equal on every rank: it is the message sequence.
     std::vector<int> exchange_seq;
 };
 
-// `group_order` is the GroupPlan's order (one entry per step).
+// PlanTiming::kAhead. `group_order` is the GroupPlan's order (one entry per step).
 LayerProgram build_layer_program(int rank, const std::vector<int>& group_order, const PipelineOptions& options);
+// PlanTiming::kFromCounts with `steps` steps: route -> counts -> plan -> pack,
+// and every dispatch waits for the pack. Operation::group is -1 (the plan is
+// not known yet).
+LayerProgram build_scheduled_program(int rank, int steps, const PipelineOptions& options);
+// Either of the above, as `source` asks.
+LayerProgram build_program(int rank, const PlanSource& source, const PipelineOptions& options);
 
 // Throws std::logic_error unless the dependency and queue invariants hold.
 void validate_program(const LayerProgram& program);
@@ -176,18 +226,22 @@ struct EpPlan {
     ep::EpShape shape;
     planner::GroupPlan groups;
     PipelineOptions options;
+    PlanTiming timing = PlanTiming::kAhead;
     ep::DispatchPlan rows;  // rows.steps follow groups.order
     BufferNeeds buffers;
 };
 
 EpPlan make_ep_plan(const ep::EpShape& shape, const planner::GroupPlan& groups, const PipelineOptions& options,
                     const std::vector<std::int64_t>& send_counts, const std::vector<std::int64_t>& recv_counts,
-                    std::size_t slot_bytes);
+                    std::size_t slot_bytes, PlanTiming timing = PlanTiming::kAhead);
 
 // Tags carry the step so a mismatch names it.
 std::uint32_t exchange_tag(const LayerProgram& program, int op);
-// Counts exchange layout: experts_per_rank 64-bit counts to and from every peer.
-transport::peer::ExchangeLayout counts_layout(const ep::EpShape& shape);
+// 64-bit counts per peer in the counts exchange: experts_per_rank (kAhead)
+// or num_experts (kFromCounts: the full row to every peer).
+std::size_t counts_per_peer(const ep::EpShape& shape, PlanTiming timing);
+// Counts exchange layout: counts_per_peer() 64-bit counts to and from every peer.
+transport::peer::ExchangeLayout counts_layout(const ep::EpShape& shape, PlanTiming timing);
 // Byte layout of a kDispatch or kCombine op (kCounts: counts_layout()).
 const transport::peer::ExchangeLayout& exchange_layout(const LayerProgram& program, int op, const EpPlan& plan);
 // The outgoing messages of an exchange op, one per peer (including self and
@@ -198,12 +252,14 @@ std::vector<Message> outgoing_messages(const LayerProgram& program, int op, cons
 // ---- Work sizes for cost models -------------------------------------------
 
 struct ComputeWork {
-    std::int64_t entries = 0;                // kRoute: tokens * top_k
+    std::int64_t entries = 0;                // kRoute, kPack: tokens * top_k
+    bool route_packs = false;                // kRoute: also places and packs (kAhead)
     std::int64_t tokens = 0;                 // kReduce
     std::int64_t permute_rows = 0;           // kExpert: rows unpacked (= rows repacked)
     std::int64_t permute_segments = 0;       // kExpert
     std::vector<std::int64_t> expert_rows;   // kExpert: rows per local expert of the step
 };
+// kRoute and kPack need only the shape of `plan` (they run before it exists).
 ComputeWork compute_work(const LayerProgram& program, int op, const EpPlan& plan, int tokens);
 
 // ---- Profiles ---------------------------------------------------------------

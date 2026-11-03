@@ -80,8 +80,8 @@ MoeLayer::MoeLayer(transport::peer::PeerExchanger& exchanger, const MoeLayerConf
     tables_dev_ = device_alloc<std::byte>(tables_bytes_);
     counts_host_ = host_alloc<std::int32_t>(s.num_experts + 1);
     order_host_ = host_alloc<std::int32_t>(s.num_experts);
-    send_counts_ = host_alloc<std::uint64_t>(s.num_experts);
-    recv_counts_ = host_alloc<std::uint64_t>(segments);
+    send_counts_ = host_alloc<std::uint64_t>(static_cast<std::size_t>(s.world) * s.num_experts);
+    recv_counts_ = host_alloc<std::uint64_t>(static_cast<std::size_t>(s.world) * s.num_experts);
     tables_host_ = host_alloc<std::byte>(tables_bytes_);
 }
 
@@ -148,8 +148,15 @@ void MoeLayer::launch_step(int i, cudaStream_t stream) {
 ForwardTimes MoeLayer::forward(std::uint64_t epoch, const bf16* x, int tokens, const std::int32_t* topk_ids,
                                const float* topk_weights, bf16* out, const planner::GroupPlan& groups,
                                const PipelineOptions& options, cudaStream_t stream) {
+    return forward(epoch, x, tokens, topk_ids, topk_weights, out, exec::PlanSource::ahead(groups), options, stream);
+}
+
+ForwardTimes MoeLayer::forward(std::uint64_t epoch, const bf16* x, int tokens, const std::int32_t* topk_ids,
+                               const float* topk_weights, bf16* out, const exec::PlanSource& source,
+                               const PipelineOptions& options, cudaStream_t stream) {
     using exec::Condition;
     using exec::OpKind;
+    using exec::PlanTiming;
     const EpShape& s = config_.shape;
     const int E = s.num_experts;
     const int W = s.world;
@@ -158,8 +165,10 @@ ForwardTimes MoeLayer::forward(std::uint64_t epoch, const bf16* x, int tokens, c
         throw std::invalid_argument("MoeLayer::forward: " + std::to_string(tokens) + " tokens exceed max_tokens " +
                                     std::to_string(config_.max_tokens));
     }
-    const std::vector<std::int32_t> order = send_expert_order(s, groups);  // validates the plan
-    program_ = exec::build_layer_program(s.rank, groups.order, options);
+    const bool ahead = source.timing == PlanTiming::kAhead;
+    std::vector<std::int32_t> order;  // send-buffer expert order
+    if (ahead) order = send_expert_order(s, source.plan);  // validates the plan
+    program_ = exec::build_program(s.rank, source, options);
     const exec::LayerProgram& p = program_;
     const int n = static_cast<int>(p.ops.size());
     while (static_cast<int>(op_done_.size()) < n) {
@@ -189,35 +198,66 @@ ForwardTimes MoeLayer::forward(std::uint64_t epoch, const bf16* x, int tokens, c
         stream_ops.push_back(op);
     };
 
+    // Places every entry at its send row (`ord`: expert order of the send
+    // buffer) and packs the rows; needs the count kernel's counts_dev_.
+    auto launch_pack = [&](const std::vector<std::int32_t>& ord, cudaStream_t st) {
+        std::copy(ord.begin(), ord.end(), order_host_);
+        CUDA_CHECK_THROW(cudaMemcpyAsync(order_dev_, order_host_, E * sizeof(std::int32_t), cudaMemcpyHostToDevice, st));
+        launch_place_entries(topk_ids, entries, E, order_dev_, counts_dev_, positions_, st);
+        launch_pack_rows(x, s.hidden, positions_, entries, s.top_k, send_, st);
+    };
+
     auto issue = [&](int op) {
         const exec::Operation& o = p.ops[op];
         switch (o.kind) {
             case OpKind::kRoute:
-                // Send rows ordered by step, then expert.
-                std::copy(order.begin(), order.end(), order_host_);
-                CUDA_CHECK_THROW(cudaMemcpyAsync(order_dev_, order_host_, E * sizeof(std::int32_t),
-                                                 cudaMemcpyHostToDevice, stream));
                 launch_count_experts(topk_ids, entries, E, counts_dev_, stream);
-                launch_place_entries(topk_ids, entries, E, order_dev_, counts_dev_, positions_, stream);
-                launch_pack_rows(x, s.hidden, positions_, entries, s.top_k, send_, stream);
+                if (ahead) launch_pack(order, stream);  // send rows ordered by step, then expert
                 CUDA_CHECK_THROW(cudaMemcpyAsync(counts_host_, counts_dev_, (E + 1) * sizeof(std::int32_t),
                                                  cudaMemcpyDeviceToHost, stream));
                 record(op);
                 break;
-            case OpKind::kCounts:
-                // Peer d receives N(rank, e) for its experts e.
+            case OpKind::kCounts: {
+                // kAhead: peer d receives N(rank, e) for its experts e.
+                // kFromCounts: every peer receives the whole row N(rank, .).
                 if (counts_host_[E] != 0) {
                     throw std::invalid_argument("MoeLayer::forward: " + std::to_string(counts_host_[E]) +
                                                 " expert ids out of range");
                 }
-                for (int e = 0; e < E; ++e) send_counts_[e] = static_cast<std::uint64_t>(counts_host_[e]);
-                ids[op] = transport::peer::exchange_counts_async(ex_, epoch, send_counts_, recv_counts_,
-                                                                 static_cast<std::size_t>(epr));
+                const std::size_t per_peer = exec::counts_per_peer(s, source.timing);
+                for (int d = 0; d < (ahead ? 1 : W); ++d) {
+                    for (int e = 0; e < E; ++e) {
+                        send_counts_[d * E + e] = static_cast<std::uint64_t>(counts_host_[e]);
+                    }
+                }
+                ids[op] = transport::peer::exchange_counts_async(ex_, epoch, send_counts_, recv_counts_, per_peer);
                 break;
+            }
             case OpKind::kPlan: {
                 const std::vector<std::int64_t> send_counts(counts_host_, counts_host_ + E);
-                const std::vector<std::int64_t> recv_counts(recv_counts_, recv_counts_ + W * epr);
-                plan_ = exec::make_ep_plan(s, groups, options, send_counts, recv_counts, ex_.slot_bytes());
+                std::vector<std::int64_t> recv_counts(static_cast<std::size_t>(W) * epr);
+                planner::GroupPlan groups;
+                if (ahead) {
+                    recv_counts.assign(recv_counts_, recv_counts_ + W * epr);
+                    groups = source.plan;
+                } else {
+                    // recv_counts_[s * E + e] = N(s, e) on every rank.
+                    const std::vector<std::int64_t> global(recv_counts_, recv_counts_ + W * E);
+                    for (int e = 0; e < E; ++e) {
+                        if (global[static_cast<std::size_t>(s.rank) * E + e] != send_counts[e]) {
+                            throw std::logic_error("MoeLayer::forward: own counts row differs after the exchange");
+                        }
+                    }
+                    groups = exec::resolve_plan(source, W, E, global);
+                    for (int src = 0; src < W; ++src) {
+                        for (int j = 0; j < epr; ++j) {
+                            recv_counts[src * epr + j] = global[static_cast<std::size_t>(src) * E + s.first_local_expert() + j];
+                        }
+                    }
+                    order = send_expert_order(s, groups);
+                }
+                plan_ = exec::make_ep_plan(s, groups, options, send_counts, recv_counts, ex_.slot_bytes(),
+                                           source.timing);
                 if (plan_.buffers.recv_rows > config_.max_recv_rows) {
                     throw std::length_error("MoeLayer::forward: " + std::to_string(plan_.buffers.recv_rows) +
                                             " received rows exceed max_recv_rows " +
@@ -239,6 +279,10 @@ ForwardTimes MoeLayer::forward(std::uint64_t epoch, const bf16* x, int tokens, c
                 break;
             case OpKind::kExpert:
                 launch_step(o.step, stream);
+                record(op);
+                break;
+            case OpKind::kPack:
+                launch_pack(order, stream);
                 record(op);
                 break;
             case OpKind::kReduce:
@@ -287,6 +331,8 @@ ForwardTimes MoeLayer::forward(std::uint64_t epoch, const bf16* x, int tokens, c
     const auto& ot = times.ops;
     times.route = ot[p.route].complete;
     times.counts = ot[p.counts].complete - times.route;
+    times.plan = ot[p.plan].issue_end - ot[p.plan].issue_begin;
+    if (p.pack >= 0) times.pack = ot[p.pack].complete - ot[p.pack].issue_begin;
     double last_combine = 0;
     for (int op : p.combine) last_combine = std::max(last_combine, ot[op].complete);
     times.pipeline = last_combine - ot[p.dispatch[0]].issue_begin;

@@ -63,6 +63,10 @@ struct CostProfile {
 namespace cost {
 // GPU, tables over the given x.
 inline constexpr const char* kRoute = "gpu_route_us";             // x: entries (count+place+pack+counts D2H)
+// PlanTiming::kFromCounts splits the route: count + counts D2H, then (after
+// the plan) send-order upload + place + pack.
+inline constexpr const char* kCount = "gpu_count_us";             // x: entries
+inline constexpr const char* kPack = "gpu_pack_us";               // x: entries
 inline constexpr const char* kPermute = "gpu_permute_us";         // x: rows (one unpack or repack)
 inline constexpr const char* kExpertFfn = "gpu_expert_ffn_us";    // x: rows of one expert
 inline constexpr const char* kExpertProbe = "gpu_expert_probe_us";  // x: rows of one step
@@ -99,6 +103,11 @@ inline constexpr const char* kHostRouteIssue = "host_route_issue_us";
 inline constexpr const char* kHostExpertIssue = "host_expert_issue_us";  // table, x: experts with rows
 inline constexpr const char* kHostReduceIssue = "host_reduce_issue_us";
 inline constexpr const char* kHostPlan = "host_plan_us";                 // table, x: steps
+inline constexpr const char* kHostCountIssue = "host_count_issue_us";    // kFromCounts route
+inline constexpr const char* kHostPackIssue = "host_pack_issue_us";
+// Scheduler run time, table per scheduler: "host_schedule_us_<name>",
+// x: num_experts * groups (kFromCounts plan op, added to kHostPlan).
+inline constexpr const char* kHostSchedule = "host_schedule_us_";
 inline constexpr const char* kHostExchangeIssue = "host_exchange_issue_us";
 inline constexpr const char* kHostPost = "host_post_chunk_us";           // write_chunk call
 inline constexpr const char* kHostCopyOut = "host_copy_out_us";          // copy_out call

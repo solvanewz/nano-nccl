@@ -72,11 +72,16 @@ void run_trial(std::mt19937_64& rng, int trial) {
     const int W = worlds[rng() % 5];
     const int epr = 1 + static_cast<int>(rng() % 4);
     const int E = W * epr;
-    const GroupPlan groups = random_plan(rng, W, E);
+    GroupPlan groups = random_plan(rng, W, E);
     // N[s][e], with many zeros.
     std::vector<std::vector<std::int64_t>> N(W, std::vector<std::int64_t>(E));
     for (auto& row : N) {
         for (auto& n : row) n = rng() % 3 == 0 ? 0 : static_cast<std::int64_t>(rng() % 6);
+    }
+    if (rng() % 4 == 0) {  // a plan that depends on these counts
+        nano_nccl::planner::ScheduleRequest req{W, E, 1 + static_cast<int>(rng() % E), {}};
+        for (const auto& row : N) req.counts.insert(req.counts.end(), row.begin(), row.end());
+        groups = nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kTokenGreedy, req);
     }
 
     std::vector<EpShape> shapes;
@@ -198,7 +203,7 @@ bool test_scheduler() {
             ok = false;
         }
     };
-    for (pl::SchedulerKind k : {pl::SchedulerKind::kFixed}) {
+    for (pl::SchedulerKind k : {pl::SchedulerKind::kFixed, pl::SchedulerKind::kTokenGreedy}) {
         check(pl::parse_scheduler(pl::scheduler_name(k)) == k, std::string("name round trip ") + pl::scheduler_name(k));
     }
     for (int W : {1, 2, 4, 8}) {
@@ -242,6 +247,90 @@ bool test_scheduler() {
     return ok;
 }
 
+// sum over groups of the busiest rank's rows (token_greedy's objective).
+std::int64_t step_max_sum(const GroupPlan& plan, const std::vector<std::int64_t>& counts, int W, int E) {
+    const int epr = E / W;
+    std::vector<std::int64_t> load(static_cast<std::size_t>(W) * plan.groups(), 0);
+    for (int s = 0; s < W; ++s) {
+        for (int e = 0; e < E; ++e) load[(e / epr) * plan.groups() + plan.expert_group[e]] += counts[s * E + e];
+    }
+    std::int64_t sum = 0;
+    for (int g = 0; g < plan.groups(); ++g) {
+        std::int64_t m = 0;
+        for (int r = 0; r < W; ++r) m = std::max(m, load[r * plan.groups() + g]);
+        sum += m;
+    }
+    return sum;
+}
+
+bool test_token_greedy() {
+    namespace pl = nano_nccl::planner;
+    bool ok = true;
+    auto check = [&ok](bool cond, const std::string& what) {
+        if (!cond) {
+            std::printf("FAIL token_greedy: %s\n", what.c_str());
+            ok = false;
+        }
+    };
+    const auto kind = pl::SchedulerKind::kTokenGreedy;
+    check(pl::scheduler_reads_counts(kind), "must read the counts");
+    // Hand example: rank 0 hosts experts 0 (10 rows) and 1 (1 row), rank 1
+    // hosts 2 (1 row) and 3 (10 rows). Fixed pairs 0 with 2 and 1 with 3:
+    // 10 + 10 = 20. Pairing the two heavy experts reaches the bound 10 + 1.
+    {
+        const pl::ScheduleRequest req{2, 4, 2, {10, 1, 1, 10, 0, 0, 0, 0}};
+        const GroupPlan p = pl::make_schedule(kind, req);
+        check(p.expert_group == std::vector<int>({0, 1, 1, 0}), "hand example mapping");
+        check(p.order == std::vector<int>({1, 0}), "hand example order: small step first");
+        check(step_max_sum(p, req.counts, 2, 4) == 11, "hand example objective");
+        check(step_max_sum(pl::fixed_group_plan(2, 4, 2), req.counts, 2, 4) == 20, "hand example fixed objective");
+    }
+    std::mt19937_64 rng(777);
+    double greedy_sum = 0, fixed_sum = 0;
+    int compared = 0, worse = 0;
+    for (int trial = 0; trial < 2000; ++trial) {
+        const int W = 1 << (rng() % 4), epr = 1 + static_cast<int>(rng() % 8), E = W * epr;
+        const int G = 1 + static_cast<int>(rng() % E);
+        const bool uniform = rng() % 5 == 0;
+        pl::ScheduleRequest req{W, E, G, std::vector<std::int64_t>(static_cast<std::size_t>(W) * E)};
+        for (auto& n : req.counts) {
+            n = uniform ? 7 : (rng() % 4 == 0 ? 0 : static_cast<std::int64_t>(rng() % (1 + rng() % 1000)));
+        }
+        const GroupPlan p = pl::make_schedule(kind, req);
+        const std::string where = "trial " + std::to_string(trial);
+        check(p.groups() == G, where + ": group count");
+        GroupPlan q = pl::make_schedule(kind, req);
+        check(q.expert_group == p.expert_group && q.order == p.order, where + ": not deterministic");
+        // Lower bounds: the busiest rank's total, and the largest expert.
+        std::vector<std::int64_t> total(static_cast<std::size_t>(W), 0);
+        std::int64_t largest = 0;
+        for (int e = 0; e < E; ++e) {
+            std::int64_t rows = 0;
+            for (int s = 0; s < W; ++s) rows += req.counts[s * E + e];
+            total[e / epr] += rows;
+            largest = std::max(largest, rows);
+        }
+        const std::int64_t bound = std::max(*std::max_element(total.begin(), total.end()), largest);
+        const std::int64_t got = step_max_sum(p, req.counts, W, E);
+        check(got >= bound, where + ": below the lower bound");
+        if (G == 1) check(got == bound, where + ": one group must equal the busiest rank");
+        // Equal experts and groups dividing epr: every step equal, at the bound.
+        if (uniform && epr % G == 0) check(got == bound, where + ": uniform load not at the bound");
+        if (G <= epr) {
+            const std::int64_t fixed = step_max_sum(pl::fixed_group_plan(W, E, G), req.counts, W, E);
+            greedy_sum += static_cast<double>(got);
+            fixed_sum += static_cast<double>(fixed);
+            ++compared;
+            worse += got > fixed ? 1 : 0;
+        }
+    }
+    std::printf("token_greedy vs fixed objective over %d trials: %.3f of fixed on average, worse in %d\n", compared,
+                greedy_sum / fixed_sum, worse);
+    check(greedy_sum < fixed_sum, "not better than fixed on average");
+    if (ok) std::printf("PASS token_greedy\n");
+    return ok;
+}
+
 template <typename Fn>
 bool expect_invalid(const char* name, Fn fn) {
     try {
@@ -270,6 +359,7 @@ int main() {
     std::printf("trials: %d passed, %d failed\n", kTrials - failed, failed);
     bool ok = failed == 0;
     ok &= test_scheduler();
+    ok &= test_token_greedy();
     ok &= expect_invalid("group_out_of_range", [] {
         nano_nccl::planner::validate_group_plan({{0, 2}, {0, 1}}, 2);
     });
@@ -287,6 +377,13 @@ int main() {
     ok &= expect_invalid("schedule_negative_count", [] {
         nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kFixed,
                                           {2, 4, 2, {1, 2, 3, 4, 5, 6, 7, -1}});
+    });
+    ok &= expect_invalid("token_greedy_needs_counts", [] {
+        nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kTokenGreedy, {2, 4, 2, {}});
+    });
+    ok &= expect_invalid("token_greedy_too_many_groups", [] {
+        nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kTokenGreedy,
+                                          {2, 4, 5, {1, 1, 1, 1, 1, 1, 1, 1}});
     });
     ok &= expect_invalid("schedule_bad_world", [] {
         nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kFixed, {3, 4, 1, {}});

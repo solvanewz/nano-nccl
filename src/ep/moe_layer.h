@@ -54,8 +54,10 @@ struct OpTimes {
 };
 
 struct ForwardTimes {
-    double route = 0;     // count + place + pack kernels, counts copied to the host
+    double route = 0;     // count [+ place + pack (kAhead)] kernels, counts copied to the host
     double counts = 0;    // exchange_counts until readable
+    double plan = 0;      // plan op (host): [scheduler +] row plan + table upload issue
+    double pack = 0;      // kFromCounts: pack op issue .. done; 0 for kAhead
     double pipeline = 0;  // first dispatch issued .. last combine readable
     double reduce = 0;    // weighted top-k sum
     double total = 0;     // including waiting for every exchange to finish
@@ -71,9 +73,11 @@ struct ForwardTimes {
 // exec::ProgramCursor says its dependencies hold, so with overlap step i's
 // experts start as soon as its dispatch is readable while later dispatches
 // and earlier combines run on the copy engines. The simulator executes the
-// same program with the same rule. The GroupPlan is fixed for the call.
+// same program with the same rule. The GroupPlan is fixed for the call: given
+// up front (PlanTiming::kAhead) or computed by the scheduler from this call's
+// global counts at the plan op, before any row is packed (kFromCounts).
 //
-// Collective: every rank calls forward() with the same epoch, GroupPlan and
+// Collective: every rank calls forward() with the same epoch, PlanSource and
 // PipelineOptions, in the same sequence.
 //
 // Buffers (each step uses its own disjoint rows, so steps never share them):
@@ -97,6 +101,10 @@ public:
     // x: [tokens, hidden] bf16, topk_ids: [tokens, top_k] int32 global expert
     // ids (distinct per token), topk_weights: [tokens, top_k] fp32, out:
     // [tokens, hidden] bf16; all device memory. Blocks until done.
+    ForwardTimes forward(std::uint64_t epoch, const bf16* x, int tokens, const std::int32_t* topk_ids,
+                         const float* topk_weights, bf16* out, const exec::PlanSource& source,
+                         const PipelineOptions& options, cudaStream_t stream);
+    // PlanSource::ahead(groups).
     ForwardTimes forward(std::uint64_t epoch, const bf16* x, int tokens, const std::int32_t* topk_ids,
                          const float* topk_weights, bf16* out, const planner::GroupPlan& groups,
                          const PipelineOptions& options, cudaStream_t stream);
@@ -124,7 +132,8 @@ private:
     std::int32_t* counts_dev_ = nullptr;
     std::int32_t* order_dev_ = nullptr;
     void* tables_dev_ = nullptr;  // per-step segments
-    // Pinned host memory.
+    // Pinned host memory. send/recv counts hold W * E values (kFromCounts:
+    // the full row to and from every peer; kAhead uses W * epr of them).
     std::int32_t* counts_host_ = nullptr;
     std::int32_t* order_host_ = nullptr;
     std::uint64_t* send_counts_ = nullptr;

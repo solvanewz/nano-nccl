@@ -20,7 +20,8 @@
 //   interference    copy slowdown while both GPUs compute, expert slowdown
 //                   while every copy engine is busy;
 //   host scalars    wall time of the issuing calls, idle-stream launch
-//                   latencies, one exchanger issue.
+//                   latencies, one exchanger issue, each scheduler's run time
+//                   (planner::make_schedule) per experts x groups.
 #include "cost_profile.h"
 #include "core/numa.h"
 #include "ep/ep_kernels.h"
@@ -28,6 +29,7 @@
 #include "ep/synthetic_routing.h"
 #include "exec/exec_program.h"
 #include "planner/group_plan.h"
+#include "planner/scheduler.h"
 #include "transport/peer/peer_exchanger.h"
 #include "transport/peer/peer_wire.h"
 
@@ -365,16 +367,32 @@ int run(const Args& a) {
             check(cudaMemcpyAsync(counts_host, counts, (a.experts + 1) * 4, cudaMemcpyDeviceToHost, cs), "counts");
             check(cudaEventRecord(ev, cs), "record");
         };
+        // The kFromCounts split of the route: count (+ counts to host), then
+        // order upload + place + pack.
+        auto count = [&](int tokens) {
+            nano_nccl::ep::launch_count_experts(ids, tokens * a.top_k, a.experts, counts, cs);
+            check(cudaMemcpyAsync(counts_host, counts, (a.experts + 1) * 4, cudaMemcpyDeviceToHost, cs), "counts");
+            check(cudaEventRecord(ev, cs), "record");
+        };
+        auto pack = [&](int tokens) {  // needs count(tokens) before it
+            const int entries = tokens * a.top_k;
+            check(cudaMemcpyAsync(order, order_host, a.experts * 4, cudaMemcpyHostToDevice, cs), "order");
+            nano_nccl::ep::launch_place_entries(ids, entries, a.experts, order, counts, positions, cs);
+            nano_nccl::ep::launch_pack_rows(x, a.hidden, positions, entries, a.top_k, rows, cs);
+            check(cudaEventRecord(ev, cs), "record");
+        };
         auto route_and_wait = [&](int tokens) {  // leaves valid positions for the reduce
             route(tokens);
             check(cudaStreamSynchronize(cs), "sync");
         };
-        std::vector<std::pair<double, double>> rt, rd;
+        std::vector<std::pair<double, double>> rt, rd, ct, pk;
         std::vector<int> token_points{128, 512, 1024, 2048, 4096, 8192};
         if (a.quick) token_points = {512, 4096};
         for (int t : token_points) {
             if (t > max_tokens) continue;
             rt.push_back({static_cast<double>(t) * a.top_k, device_us(g[0], cs, 10, [&] { route(t); })});
+            ct.push_back({static_cast<double>(t) * a.top_k, device_us(g[0], cs, 10, [&] { count(t); })});
+            pk.push_back({static_cast<double>(t) * a.top_k, device_us(g[0], cs, 10, [&] { pack(t); })});
             route_and_wait(t);
             rd.push_back({static_cast<double>(t), device_us(g[0], cs, 10, [&] {
                               nano_nccl::ep::launch_combine_reduce(rows, positions, weights, t, a.top_k, a.hidden,
@@ -382,8 +400,13 @@ int run(const Args& a) {
                           })});
         }
         add_table(p, cost::kRoute, "entries", rt);
+        add_table(p, cost::kCount, "entries", ct);
+        add_table(p, cost::kPack, "entries", pk);
         add_table(p, cost::kReduce, "tokens", rd);
         add_scalar(p, cost::kHostRouteIssue, host_us(g[0], cs, 20, [&] { route(max_tokens); }));
+        add_scalar(p, cost::kHostCountIssue, host_us(g[0], cs, 20, [&] { count(max_tokens); }));
+        count(max_tokens);
+        add_scalar(p, cost::kHostPackIssue, host_us(g[0], cs, 20, [&] { pack(max_tokens); }));
         add_scalar(p, cost::kHostReduceIssue, host_us(g[0], cs, 20, [&] {
                        nano_nccl::ep::launch_combine_reduce(rows, positions, weights, max_tokens, a.top_k, a.hidden,
                                                             out, cs);
@@ -459,6 +482,27 @@ int run(const Args& a) {
                                 })});
         }
         add_table(p, cost::kHostPlan, "steps", plan_pts);
+        // Scheduler run time on this shape's counts, per group count.
+        nano_nccl::planner::ScheduleRequest req{a.world, a.experts, 1, {}};
+        for (const auto& row : n) req.counts.insert(req.counts.end(), row.begin(), row.end());
+        for (auto kind : {nano_nccl::planner::SchedulerKind::kFixed, nano_nccl::planner::SchedulerKind::kTokenGreedy}) {
+            const int max_groups = kind == nano_nccl::planner::SchedulerKind::kFixed ? epr : a.experts;
+            std::vector<std::pair<double, double>> pts;
+            for (int groups = 1;; groups = std::min(groups * 2, max_groups)) {
+                req.groups = groups;
+                std::vector<double> t;
+                for (int i = 0; i < 200; ++i) {
+                    const auto t0 = Clock::now();
+                    const auto plan = nano_nccl::planner::make_schedule(kind, req);
+                    t.push_back(wall_us(t0, Clock::now()));
+                    if (plan.groups() != groups) throw std::logic_error("scheduler group count");
+                }
+                pts.push_back({static_cast<double>(a.experts) * groups, median(t)});
+                if (groups == max_groups) break;
+            }
+            add_table(p, std::string(cost::kHostSchedule) + nano_nccl::planner::scheduler_name(kind), "expert_groups",
+                      pts);
+        }
         cudaFreeHost(tables_host);
         cudaFree(tables_dev);
 
