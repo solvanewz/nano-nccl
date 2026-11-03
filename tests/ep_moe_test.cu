@@ -17,7 +17,7 @@
 //   ep_moe_test --ffn [--tokens T --experts E --topk K --hidden H --ffn-dim F
 //                      --iters N --skew X --groups G --lookahead L
 //                      --no-overlap --scheduler NAME --plan-from-counts
-//                      --random-plan SEED --dump DIR --trace FILE]
+//                      --random-plan SEED --workload NAME --dump DIR --trace FILE]
 //       real BF16 SwiGLU experts; the group plan comes from the scheduler
 //       (planner::make_schedule, default fixed = B1) with G groups, computed
 //       from each forward's counts when the scheduler reads them or with
@@ -324,6 +324,7 @@ struct FfnArgs {
     int lookahead = 1;
     bool overlap = true;
     std::string scheduler = "fixed";
+    std::string workload = "zipf";  // ep::Workload name
     bool from_counts = false;
     long long random_plan = -1;  // >= 0: planner::random_group_plan seed
     std::string dump;
@@ -349,7 +350,7 @@ void write_trace(const FfnArgs& a, const EpShape& s, const MoeLayer& layer, cons
                static_cast<int>(counts.size()), MPI_INT64_T, 0, MPI_COMM_WORLD);
     if (g_rank != 0) return;
     exec::LayerTrace t;
-    t.key = exec::ProfileKey{g_world, s.num_experts, s.top_k, s.hidden, s.ffn, a.tokens, "zipf", a.skew,
+    t.key = exec::ProfileKey{g_world, s.num_experts, s.top_k, s.hidden, s.ffn, a.tokens, nano_nccl::ep::parse_workload(a.workload, a.skew).name(), a.skew,
                              "bf16", "ffn", "shm", a.slots, a.slot_bytes};
     t.groups = layer.last_ep_plan().groups;  // the plan that ran
     t.timing = source.timing;
@@ -401,7 +402,9 @@ int run_ffn(const FfnArgs& a) {
     MoeLayer layer(*g_exchanger, cfg, &ffn, g_device);
 
     const auto x = random_bf16(static_cast<std::size_t>(a.tokens) * a.hidden, 77 + g_rank, 1.0f);
-    const Routing routing = make_routing(s, a.tokens, a.skew, -1, nano_nccl::ep::benchmark_routing_seed(g_rank));
+    const Routing routing =
+        make_routing(s, a.tokens, nano_nccl::ep::source_expert_weights(nano_nccl::ep::parse_workload(a.workload, a.skew), s),
+                     nano_nccl::ep::benchmark_routing_seed(g_rank));
     DeviceArray<bf16> dx(x.size()), dout(x.size());
     DeviceArray<std::int32_t> dids(routing.ids.size());
     DeviceArray<float> dw(routing.weights.size());
@@ -457,6 +460,7 @@ int run_ffn(const FfnArgs& a) {
     MPI_Allreduce(&same, &all_same, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
 
     if (g_rank == 0) {
+        std::printf("# workload %s\n", a.workload.c_str());
         std::printf("# EP MoE: ranks=%d tokens/rank=%d experts=%d top_k=%d hidden=%d ffn=%d skew=%.2f "
                     "plan=%s groups=%d overlap=%d lookahead=%d\n",
                     g_world, a.tokens, a.experts, a.top_k, a.hidden, a.ffn, a.skew, plan_name.c_str(),
@@ -556,6 +560,7 @@ int main(int argc, char** argv) {
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());
             else if (arg == "--no-overlap") a.overlap = false;
             else if (arg == "--scheduler") a.scheduler = next();
+            else if (arg == "--workload") a.workload = next();
             else if (arg == "--plan-from-counts") a.from_counts = true;
             else if (arg == "--random-plan") a.random_plan = std::atoll(next());
             else if (arg == "--trace") a.trace = next();

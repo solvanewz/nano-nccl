@@ -71,6 +71,7 @@ std::map<std::tuple<uint32_t, uint32_t, uint32_t>, Flow> g_flows;          // sp
 std::map<std::tuple<int, int, int>, Posted> g_posted;                      // src, dst, tag
 std::map<std::tuple<int, int, int>, std::uint64_t> g_unexpected;           // src, dst, tag
 int g_world = 0;
+std::uint64_t g_sent_on_ack = 0;  // messages whose send completion came from their acknowledgement
 
 void deliver(int src, int dst, int tag, std::uint64_t bytes) {
     const auto k = std::make_tuple(src, dst, tag);
@@ -89,29 +90,47 @@ void finish_flow(std::map<std::tuple<uint32_t, uint32_t, uint32_t>, Flow>::itera
     if (it->second.sent && it->second.received) g_flows.erase(it);
 }
 
-// QpComplete: the receiver has the whole message.
-void qp_finish(FILE*, Ptr<RdmaQueuePair> q) {
-    const uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
-    Ptr<RdmaDriver> rdma = n.Get(did)->GetObject<RdmaDriver>();
-    rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
-    auto it = g_flows.find(std::make_tuple(static_cast<uint32_t>(q->sport), sid, did));
-    if (it == g_flows.end()) throw std::logic_error("ns3: completion of an unknown flow");
-    it->second.received = true;
-    const Flow f = it->second;
-    finish_flow(it);
-    deliver(static_cast<int>(sid), static_cast<int>(did), f.tag, f.bytes);
-}
-
-// SendComplete: the sender's NIC sent the whole message.
-void send_finish(FILE*, Ptr<RdmaQueuePair> q) {
-    const uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
-    auto it = g_flows.find(std::make_tuple(static_cast<uint32_t>(q->sport), sid, did));
-    if (it == g_flows.end() || it->second.sent) return;
+// SimAI's send-complete hook (qbb-net-device.cc) fires after the wire time
+// of every packet a host NIC sends whose size is in (60, 9000) bytes; with
+// SimAI.conf's 9000-byte payloads that is a message's last, partial packet.
+// A message whose last packet is full, or that is a single tiny packet, gets
+// no hook at all (seen as a hang at W=8, E=64): its full acknowledgement
+// (qp_finish) then implies it was sent. The bytes-left check keeps any other
+// packet's hook from completing a message early.
+void mark_sent(std::map<std::tuple<uint32_t, uint32_t, uint32_t>, Flow>::iterator it) {
     it->second.sent = true;
     const Handler fn = it->second.on_sent;
     void* arg = it->second.sent_arg;
     finish_flow(it);
     fn(arg);
+}
+
+// QpComplete (sender side, every byte acknowledged): the receiver has the
+// whole message.
+void qp_finish(FILE*, Ptr<RdmaQueuePair> q) {
+    const uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
+    Ptr<RdmaDriver> rdma = n.Get(did)->GetObject<RdmaDriver>();
+    rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
+    const auto key = std::make_tuple(static_cast<uint32_t>(q->sport), sid, did);
+    auto it = g_flows.find(key);
+    if (it == g_flows.end()) throw std::logic_error("ns3: completion of an unknown flow");
+    const Flow f = it->second;
+    if (!f.sent) {
+        ++g_sent_on_ack;
+        mark_sent(it);
+        it = g_flows.find(key);
+    }
+    it->second.received = true;
+    finish_flow(it);
+    deliver(static_cast<int>(sid), static_cast<int>(did), f.tag, f.bytes);
+}
+
+void send_finish(FILE*, Ptr<RdmaQueuePair> q) {
+    if (q->GetBytesLeft() != 0) return;  // not the message's last packet
+    const uint32_t sid = ip_to_node_id(q->sip), did = ip_to_node_id(q->dip);
+    auto it = g_flows.find(std::make_tuple(static_cast<uint32_t>(q->sport), sid, did));
+    if (it == g_flows.end() || it->second.sent) return;
+    mark_sent(it);
 }
 
 class Ns3Network final : public AstraSim::AstraNetworkAPI {
@@ -172,6 +191,7 @@ struct Args {
     int world = 2, experts = 16, top_k = 2, hidden = 2048, ffn = 1408, tokens = 4096;
     double skew = 0.0;
     std::string scheduler = "fixed";
+    std::string workload = "zipf";
     bool from_counts = false;
     int groups = 1, lookahead = 1;
     bool overlap = true;
@@ -181,6 +201,7 @@ struct Args {
     int gbps = 100;
     double latency_us = 1.0;
     bool staged = false;  // host-staged sends (RdmaWire semantics), else GPUDirect writes
+    double max_sim_ms = 1000;  // ns-3: stop (and report a deadlock) after this much simulated time
 };
 
 // SimAI's example ns-3 configuration (inputs/config/SimAI.conf) with the
@@ -295,8 +316,13 @@ int run(const Args& a) {
     }
 
     nsim::simai::NetFabric* fabric = nullptr;
-    const nsim::SimResult res = run_layer(a, sched, eps, [](nsim::LayerSimulation& sim) {
+    const double limit_ms = a.max_sim_ms;
+    const nsim::SimResult res = run_layer(a, sched, eps, [limit_ms](nsim::LayerSimulation& sim) {
         sim.start([] { Simulator::Stop(); });
+        // DCQCN timers keep the event loop alive forever, so a message that
+        // never completes would hang the run; stop and let finish() report
+        // where the layer stopped.
+        Simulator::Stop(MicroSeconds(static_cast<uint64_t>(limit_ms * 1000.0)));
         Simulator::Run();
     }, &fabric);
     return report(a, res, *fabric);
@@ -338,12 +364,8 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
         c.slots_per_link = a.slots;
         c.slot_bytes = a.slot_bytes;
         tokens.assign(a.world, a.tokens);
-        for (int r = 0; r < a.world; ++r) {
-            const nano_nccl::ep::EpShape s{a.world, r, a.experts, a.top_k, a.hidden, a.ffn};
-            counts.push_back(nano_nccl::ep::expert_counts(
-                nano_nccl::ep::make_routing(s, a.tokens, a.skew, -1, nano_nccl::ep::benchmark_routing_seed(r)).ids,
-                a.experts));
-        }
+        counts = nano_nccl::ep::workload_counts(nano_nccl::ep::parse_workload(a.workload, a.skew),
+                                                {a.world, 0, a.experts, a.top_k, a.hidden, a.ffn}, a.tokens);
         c.plan = nano_nccl::exec::plan_source_for(nano_nccl::planner::parse_scheduler(a.scheduler), a.world,
                                                   a.experts, a.groups, a.from_counts);
     }
@@ -374,6 +396,10 @@ int report(const Args& a, const nsim::SimResult& res, const nsim::simai::NetFabr
                 static_cast<unsigned long long>(fabric->messages_sent()),
                 static_cast<unsigned long long>(fabric->sends_completed()),
                 static_cast<unsigned long long>(fabric->receives_completed()));
+    if (a.backend == "ns3") {
+        std::printf("# sends completed by their acknowledgement (single tiny packet): %llu\n",
+                    static_cast<unsigned long long>(g_sent_on_ack));
+    }
     const bool ok = fabric->messages_sent() == fabric->sends_completed() &&
                     fabric->messages_sent() == fabric->receives_completed();
     std::printf("%s_layer=%s total=%.1f\n", a.backend.c_str(), ok ? "PASS" : "FAIL", s.total);
@@ -403,6 +429,7 @@ int main(int argc, char** argv) {
             else if (arg == "--tokens") a.tokens = std::atoi(next());
             else if (arg == "--skew") a.skew = std::atof(next());
             else if (arg == "--scheduler") a.scheduler = next();
+            else if (arg == "--workload") a.workload = next();
             else if (arg == "--plan-from-counts") a.from_counts = true;
             else if (arg == "--groups") a.groups = std::atoi(next());
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());
@@ -414,6 +441,7 @@ int main(int argc, char** argv) {
             else if (arg == "--latency-us") a.latency_us = std::atof(next());
             else if (arg == "--backend") a.backend = next();
             else if (arg == "--staged") a.staged = true;
+            else if (arg == "--max-sim-ms") a.max_sim_ms = std::atof(next());
             else throw std::invalid_argument("unknown option " + arg);
         }
         const int speeds[] = {25, 50, 100, 200, 400, 1600};  // ECN maps of SimAI.conf

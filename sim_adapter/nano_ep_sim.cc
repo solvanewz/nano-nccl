@@ -9,6 +9,7 @@
 //               --tokens T --skew S --scheduler NAME --plan-from-counts --groups G
 //               --lookahead L --no-overlap --slots N --slot-bytes B
 //               --mode ffn|probe --sweep --timeline]
+//       [--workload NAME (ep::Workload, default zipf)]
 //       synthetic routing (ep::make_routing with the benchmark seeds), one
 //       configuration or, with --sweep, the A40 benchmark sweep. The group
 //       plan comes from the scheduler switch (planner::make_schedule, default
@@ -106,6 +107,7 @@ struct Args {
     int world = 2, experts = 16, top_k = 2, hidden = 2048, ffn = 1408, tokens = 4096;
     double skew = 0.0;
     std::string scheduler = "fixed";
+    std::string workload = "zipf";
     bool from_counts = false;
     int groups = 1, lookahead = 1;
     bool overlap = true, sweep = false, timeline = false;
@@ -185,14 +187,9 @@ double synthetic(const Args& a, const nano_nccl::sim::CostProfile& profile, int 
     c.hidden = a.hidden;
     c.ffn = a.ffn;
     c.mode = a.mode;
-    std::vector<std::vector<std::int64_t>> counts;
     std::vector<int> tokens(a.world, a.tokens);
-    for (int r = 0; r < a.world; ++r) {
-        const nano_nccl::ep::EpShape s{a.world, r, a.experts, a.top_k, a.hidden, a.ffn};
-        counts.push_back(nano_nccl::ep::expert_counts(
-            nano_nccl::ep::make_routing(s, a.tokens, a.skew, -1, nano_nccl::ep::benchmark_routing_seed(r)).ids,
-            a.experts));
-    }
+    const auto counts = nano_nccl::ep::workload_counts(nano_nccl::ep::parse_workload(a.workload, a.skew),
+                                                       {a.world, 0, a.experts, a.top_k, a.hidden, a.ffn}, a.tokens);
     c.plan = nano_nccl::exec::plan_source_for(nano_nccl::planner::parse_scheduler(a.scheduler), a.world, a.experts,
                                               groups, a.from_counts);
     c.options = {overlap, lookahead};
@@ -206,6 +203,7 @@ double synthetic(const Args& a, const nano_nccl::sim::CostProfile& profile, int 
     for (const auto& r : res.ranks) all.push_back(stages_of(r));
     const Stages s = slowest(all);
     if (verbose) {
+        std::printf("# workload %s\n", a.workload.c_str());
         std::printf("# simulated: world=%d experts=%d top_k=%d hidden=%d ffn=%d tokens=%d skew=%g scheduler=%s "
                     "plan=%s groups=%d overlap=%d lookahead=%d slots=%d slot_bytes=%zu\n",
                     a.world, a.experts, a.top_k, a.hidden, a.ffn, a.tokens, a.skew, a.scheduler.c_str(),
@@ -246,6 +244,7 @@ int main(int argc, char** argv) {
             else if (arg == "--tokens") a.tokens = std::atoi(next());
             else if (arg == "--skew") a.skew = std::atof(next());
             else if (arg == "--scheduler") a.scheduler = next();
+            else if (arg == "--workload") a.workload = next();
             else if (arg == "--plan-from-counts") a.from_counts = true;
             else if (arg == "--groups") a.groups = std::atoi(next());
             else if (arg == "--lookahead") a.lookahead = std::atoi(next());

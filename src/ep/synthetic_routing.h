@@ -3,6 +3,7 @@
 #include "ep/ep_plan.h"
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 // Synthetic router output for tests, benchmarks, profiling and the simulator,
@@ -17,6 +18,45 @@ struct Routing {
 // Top-k distinct experts per token, drawn with probability ~ (e + 1)^-skew;
 // with only_rank >= 0, only that rank's experts are drawn.
 Routing make_routing(const EpShape& shape, int tokens, double skew, int only_rank, std::uint64_t seed);
+
+// Top-k distinct experts per token, drawn with probability ~ expert_weights[e]
+// (E entries, non-negative, at least top_k positive). make_routing() above is
+// this with zipf weights (same draws for the same seed).
+Routing make_routing(const EpShape& shape, int tokens, const std::vector<double>& expert_weights,
+                     std::uint64_t seed);
+
+// Token -> expert distribution families (plan §D workloads). A name is
+// "<family>" or "<family>:<param>"; `skew` is the zipf exponent.
+//   zipf          w(e) = (e + 1)^-skew over global ids: the hottest experts
+//                 all sit on rank 0 (the B1 benchmark distribution).
+//   zipf_spread   zipf over a fixed pseudo-random permutation of all experts:
+//                 hot experts spread over the ranks, rank totals differ.
+//   rank_skew     every rank equally popular in total; inside rank r, local
+//                 expert j has weight (pi_r(j) + 1)^-skew with a different
+//                 permutation pi_r per rank: balanced ranks, skewed steps.
+//   local:P       rank_skew, and each source weights the experts of its own
+//                 rank P times: same expert loads, less remote traffic.
+//   pair:P        rank_skew, and source s weights the experts of rank
+//                 (s + 1) % W P times: same expert loads, traffic
+//                 concentrated on one destination per source.
+//   hot_rank:P    rank_skew with rank 0's experts weighted P times: one rank
+//                 persistently hot (grouping cannot move its compute).
+// All sources use the same expert weights except local and pair.
+struct Workload {
+    std::string family = "zipf";
+    double param = 0;  // P, where the family has one
+    double skew = 0;
+
+    std::string name() const;  // "<family>[:<param>]"
+};
+Workload parse_workload(const std::string& name, double skew);  // throws std::invalid_argument
+
+// Weights of global experts for tokens of source rank shape.rank.
+std::vector<double> source_expert_weights(const Workload& workload, const EpShape& shape);
+
+// counts[r][e] = N(r, e) when every rank r routes `tokens` tokens of
+// `workload` with benchmark_routing_seed(r) (shape.rank is ignored).
+std::vector<std::vector<std::int64_t>> workload_counts(const Workload& workload, const EpShape& shape, int tokens);
 
 // counts[e] = number of entries routed to expert e.
 std::vector<std::int64_t> expert_counts(const std::vector<std::int32_t>& ids, int num_experts);

@@ -117,8 +117,22 @@ public:
                         break;
                     }
                 }
+                // Exchanges that never reached a condition retire waits for.
+                std::string open;
+                const auto& prog = k.result.program;
+                for (std::size_t i = 0; i < prog.ops.size(); ++i) {
+                    if (prog.ops[i].queue != exec::Queue::kExchange || k.ids[i] == 0) continue;
+                    for (Condition c : {Condition::kConsumerReadable, Condition::kSendBufferReusable,
+                                        Condition::kReceiveSlotsReleased}) {
+                        if (!k.ex->query_completion(k.ids[i], exec::to_completion_event(c))) {
+                            open += std::string(open.empty() ? "" : ", ") + exec::op_kind_name(prog.ops[i].kind) +
+                                    " op " + std::to_string(i) + " step " + std::to_string(prog.ops[i].step) +
+                                    " not " + exec::condition_name(c);
+                        }
+                    }
+                }
                 throw std::runtime_error("simulate_layer: deadlock, rank " + std::to_string(r) +
-                                         " stopped before " + where);
+                                         " stopped before " + where + (open.empty() ? "" : "; " + open));
             }
             k.result.total = k.result.ops[k.result.program.retire].issue_end;
             out.makespan = std::max(out.makespan, k.result.total);

@@ -8,10 +8,12 @@
 // position it was sent from. Also checks the scheduler switch
 // (src/planner/scheduler) and its random test plans.
 #include "ep/ep_plan.h"
+#include "ep/synthetic_routing.h"
 #include "planner/group_plan.h"
 #include "planner/scheduler.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -331,6 +333,84 @@ bool test_token_greedy() {
     return ok;
 }
 
+// Workload families (ep::Workload): expected expert loads per rank.
+bool test_workloads() {
+    namespace ep = nano_nccl::ep;
+    bool ok = true;
+    auto check = [&ok](bool cond, const std::string& what) {
+        if (!cond) {
+            std::printf("FAIL workloads: %s\n", what.c_str());
+            ok = false;
+        }
+    };
+    const int W = 8, epr = 8, E = W * epr;
+    EpShape s{W, 0, E, 2, 64, 0};
+    // zipf is the original benchmark distribution, draw for draw.
+    {
+        const auto a = ep::make_routing(s, 300, 1.2, -1, 99);
+        const auto b = ep::make_routing(s, 300, ep::source_expert_weights(ep::parse_workload("zipf", 1.2), s), 99);
+        check(a.ids == b.ids && a.weights == b.weights, "zipf differs from make_routing(skew)");
+    }
+    // Expected load of rank r's experts: sum over sources of the share of
+    // their weight on r (each source's distribution normalized).
+    auto rank_load = [&](const ep::Workload& w) {
+        std::vector<double> load(W, 0);
+        for (int src = 0; src < W; ++src) {
+            EpShape t = s;
+            t.rank = src;
+            const auto wt = ep::source_expert_weights(w, t);
+            double total = 0;
+            for (double x : wt) total += x;
+            for (int e = 0; e < E; ++e) load[e / epr] += wt[e] / total;
+        }
+        return load;
+    };
+    auto equal = [](const std::vector<double>& v) {
+        for (double x : v) {
+            if (std::abs(x - v[0]) > 1e-9 * std::abs(v[0])) return false;
+        }
+        return true;
+    };
+    for (const char* name : {"rank_skew", "local:4", "pair:4"}) {
+        check(equal(rank_load(ep::parse_workload(name, 1.5))), std::string(name) + ": rank loads differ");
+    }
+    {
+        const auto l = rank_load(ep::parse_workload("hot_rank:3", 1.0));
+        check(std::abs(l[0] / l[1] - 3.0) < 1e-9 && equal(std::vector<double>(l.begin() + 1, l.end())),
+              "hot_rank:3: rank 0 is not 3x the others");
+    }
+    {
+        const auto z = rank_load(ep::parse_workload("zipf", 1.0));
+        check(z[0] > z[W - 1] * 2, "zipf: rank 0 not hot");
+    }
+    // rank_skew: different hot local expert per rank; local/pair: the bias.
+    {
+        const auto wt = ep::source_expert_weights(ep::parse_workload("rank_skew", 2.0), s);
+        int distinct = 0;
+        for (int r = 1; r < W; ++r) {
+            distinct += std::max_element(wt.begin() + r * epr, wt.begin() + (r + 1) * epr) - (wt.begin() + r * epr) !=
+                        std::max_element(wt.begin(), wt.begin() + epr) - wt.begin();
+        }
+        check(distinct > 0, "rank_skew: every rank has the same hot local expert");
+        EpShape t = s;
+        t.rank = 3;
+        const auto loc = ep::source_expert_weights(ep::parse_workload("local:5", 2.0), t);
+        const auto pair = ep::source_expert_weights(ep::parse_workload("pair:5", 2.0), t);
+        check(std::abs(loc[3 * epr] - 5 * wt[3 * epr]) < 1e-12 && loc[4 * epr] == wt[4 * epr], "local:5 bias");
+        check(std::abs(pair[4 * epr] - 5 * wt[4 * epr]) < 1e-12 && pair[3 * epr] == wt[3 * epr], "pair:5 bias");
+    }
+    const auto counts = ep::workload_counts(ep::parse_workload("pair:4", 1.0), s, 500);
+    for (const auto& row : counts) {
+        std::int64_t sum = 0;
+        for (auto n : row) sum += n;
+        check(sum == 500 * 2, "workload_counts: entries per rank");
+    }
+    check(ep::parse_workload("pair:4", 0).name() == "pair:4" && ep::parse_workload("rank_skew", 0).name() == "rank_skew",
+          "workload names");
+    if (ok) std::printf("PASS workloads\n");
+    return ok;
+}
+
 template <typename Fn>
 bool expect_invalid(const char* name, Fn fn) {
     try {
@@ -360,6 +440,7 @@ int main() {
     bool ok = failed == 0;
     ok &= test_scheduler();
     ok &= test_token_greedy();
+    ok &= test_workloads();
     ok &= expect_invalid("group_out_of_range", [] {
         nano_nccl::planner::validate_group_plan({{0, 2}, {0, 1}}, 2);
     });
@@ -385,6 +466,10 @@ int main() {
         nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kTokenGreedy,
                                           {2, 4, 5, {1, 1, 1, 1, 1, 1, 1, 1}});
     });
+    ok &= expect_invalid("workload_unknown", [] { nano_nccl::ep::parse_workload("uniform", 0); });
+    ok &= expect_invalid("workload_missing_param", [] { nano_nccl::ep::parse_workload("pair", 0); });
+    ok &= expect_invalid("workload_extra_param", [] { nano_nccl::ep::parse_workload("zipf:2", 0); });
+    ok &= expect_invalid("workload_bad_param", [] { nano_nccl::ep::parse_workload("local:-1", 0); });
     ok &= expect_invalid("schedule_bad_world", [] {
         nano_nccl::planner::make_schedule(nano_nccl::planner::SchedulerKind::kFixed, {3, 4, 1, {}});
     });
