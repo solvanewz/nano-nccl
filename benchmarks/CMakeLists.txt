@@ -3,6 +3,11 @@ add_executable(nano_nccl_ep_profile ep_profile.cu)
 target_link_libraries(nano_nccl_ep_profile PRIVATE nano_nccl_ep nano_nccl_sim nano_nccl)
 target_compile_options(nano_nccl_ep_profile PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
 
+# Expert FFN concurrency microbenchmark (serial / multi-stream / grouped GEMM); one GPU.
+add_executable(nano_nccl_expert_concurrency_bench expert_concurrency_bench.cu)
+target_link_libraries(nano_nccl_expert_concurrency_bench PRIVATE nano_nccl_ep)
+target_compile_options(nano_nccl_expert_concurrency_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+
 # Scheduler run times per world for the simulator (CPU only).
 add_executable(nano_nccl_schedule_bench schedule_bench.cc)
 target_link_libraries(nano_nccl_schedule_bench PRIVATE nano_nccl_sim nano_nccl_ep_plan)
