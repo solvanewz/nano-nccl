@@ -49,9 +49,11 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <map>
@@ -245,10 +247,23 @@ nano_nccl::planner::CostModel cost_model(const Args& a, const nsim::CostProfile&
     return m;
 }
 
+// Creates `dir` and its missing parents. SimAI's config reader loops forever
+// on a file it cannot open, so a bad --out must fail here instead.
+void make_dirs(const std::string& dir) {
+    for (std::size_t pos = dir.find('/', 1);; pos = dir.find('/', pos + 1)) {
+        const std::string part = dir.substr(0, pos);
+        if (mkdir(part.c_str(), 0755) != 0 && errno != EEXIST)
+            throw std::runtime_error("--out: cannot create " + part + ": " + std::strerror(errno));
+        if (pos == std::string::npos) break;
+    }
+    struct stat st {};
+    if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) throw std::runtime_error("--out: not a directory: " + dir);
+}
+
 // SimAI's example ns-3 configuration (inputs/config/SimAI.conf) with the
 // output files moved into `dir` and tracing off.
 void write_inputs(const Args& a, std::string& topo, std::string& conf) {
-    mkdir(a.out.c_str(), 0755);
+    make_dirs(a.out);
     topo = a.out + "/topo.txt";
     conf = a.out + "/ns3.conf";
     {
@@ -296,6 +311,8 @@ void write_inputs(const Args& a, std::string& topo, std::string& conf) {
       << "BUFFER_SIZE 32\nQLEN_MON_FILE " << a.out << "/qlen.txt\nBW_MON_FILE " << a.out << "/bw.txt\n"
       << "RATE_MON_FILE " << a.out << "/rate.txt\nCNP_MON_FILE " << a.out << "/cnp.txt\n"
       << "MON_START 0\nMON_END 20000\nQP_MON_INTERVAL 100\nQLEN_MON_INTERVAL 10000\nBW_MON_INTERVAL 10000\n";
+    c.flush();
+    if (!c || !std::ifstream(topo)) throw std::runtime_error("--out: cannot write the ns-3 inputs in " + a.out);
 }
 
 struct Stages {
