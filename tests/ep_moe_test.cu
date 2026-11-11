@@ -19,7 +19,8 @@
 //                      --iters N --skew X --groups G --lookahead L
 //                      --no-overlap --scheduler NAME --plan-from-counts
 //                      --random-plan SEED --workload NAME --dump DIR --trace FILE
-//                      --cost-profile P --fallback-permille N]
+//                      --cost-profile P --fallback-permille N
+//                      --cost-link GBPS[:EXCHANGE_US]]
 //       real BF16 SwiGLU experts; the group plan comes from the scheduler
 //       (planner::make_schedule, default fixed = B1) with G groups, computed
 //       from each forward's counts when the scheduler reads them or with
@@ -27,7 +28,9 @@
 //       from planner::random_group_plan over at most G groups. cost_aware
 //       needs --cost-profile (an ep_profile/calibrated profile): its model is
 //       sim::planner_cost_model over the profile's host-staged copy rates,
-//       the same one nano_ep_sim builds, so a replay reproduces the plan.
+//       the same one nano_ep_sim builds, so a replay reproduces the plan;
+//       --cost-link replaces the copy rates by sim::link_rates(GBPS, 0,
+//       slot bytes, EXCHANGE_US), e.g. a fit of the measured RdmaWire rate.
 //       Prints stage times and the step timeline, and checks that the output
 //       is bit-identical to a serial (one group, no overlap) forward. With
 //       --dump, writes inputs, weights and outputs for
@@ -381,6 +384,8 @@ struct FfnArgs {
     std::size_t slot_bytes = 0;
     std::string cost_profile;     // cost_aware: profile for its cost model
     int fallback_permille = -1;   // cost_aware: override the model's default
+    double cost_link_gbps = 0;        // cost_aware: > 0 models the fabric as this link
+    double cost_link_exchange_us = 0;  // ... with this fixed cost per exchange
     int warmup = 2;
     bool iter_stats = false;
     std::string wire = "shm";
@@ -537,8 +542,13 @@ int run_ffn(const FfnArgs& a) {
         if (plan.scheduler == pl::SchedulerKind::kCostAware) {
             if (a.cost_profile.empty()) throw std::invalid_argument("--scheduler cost_aware needs --cost-profile");
             const auto prof = nano_nccl::sim::CostProfile::load(a.cost_profile);
-            auto m = nano_nccl::sim::planner_cost_model(prof, a.hidden, 1.0,
-                                                        nano_nccl::sim::copy_rates(prof, g_exchanger->slot_bytes()));
+            // Fabric: the profile's host-staged copies (ShmWire), or a measured
+            // network link (--cost-link, e.g. RdmaWire between hosts).
+            const auto fabric =
+                a.cost_link_gbps > 0
+                    ? nano_nccl::sim::link_rates(a.cost_link_gbps, 0.0, g_exchanger->slot_bytes(), a.cost_link_exchange_us)
+                    : nano_nccl::sim::copy_rates(prof, g_exchanger->slot_bytes());
+            auto m = nano_nccl::sim::planner_cost_model(prof, a.hidden, 1.0, fabric);
             if (a.fallback_permille >= 0) m.fallback_permille = a.fallback_permille;
             plan.cost = std::make_shared<const pl::CostModel>(m);
         }
@@ -706,6 +716,13 @@ int main(int argc, char** argv) {
             else if (arg == "--trace") a.trace = next();
             else if (arg == "--cost-profile") a.cost_profile = next();
             else if (arg == "--fallback-permille") a.fallback_permille = std::atoi(next());
+            else if (arg == "--cost-link") {
+                const std::string v = next();  // GBPS[:EXCHANGE_US]
+                a.cost_link_gbps = std::atof(v.c_str());
+                const auto colon = v.find(':');
+                if (colon != std::string::npos) a.cost_link_exchange_us = std::atof(v.c_str() + colon + 1);
+                if (!(a.cost_link_gbps > 0)) throw std::invalid_argument("--cost-link needs GBPS > 0");
+            }
             else if (arg == "--warmup") a.warmup = std::atoi(next());
             else if (arg == "--iter-stats") a.iter_stats = true;
             else if (arg == "--wire") a.wire = next();
