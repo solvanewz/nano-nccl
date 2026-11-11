@@ -192,6 +192,15 @@ if(NANO_NCCL_ENABLE_MPI)
         target_compile_definitions(nano_nccl_peer_rdma PUBLIC OMPI_SKIP_MPICXX)
         target_link_libraries(nano_nccl_peer_rdma PUBLIC
             nano_nccl_peer nano_nccl_rdma_verbs CUDA::cudart MPI::MPI_C ${IBVERBS_LIBRARY})
+
+        # EP wire for multi-node runs: same-node links over ShmWire (NVLink via
+        # CUDA IPC, or host memory), other links over RdmaWire (GPUDirect via
+        # B0's device registration in nano_nccl, or host-staged).
+        add_library(nano_nccl_peer_hybrid STATIC transport/peer/hybrid_wire.cc)
+        set_target_properties(nano_nccl_peer_hybrid PROPERTIES POSITION_INDEPENDENT_CODE ON)
+        target_compile_options(nano_nccl_peer_hybrid PRIVATE -O2 -Wall -Wextra)
+        target_link_libraries(nano_nccl_peer_hybrid PUBLIC
+            nano_nccl_peer_shm nano_nccl_peer_rdma nano_nccl ${IBVERBS_LIBRARY})
     endif()
 
     if(NANO_NCCL_SOCKET_TEST_FAULT_INJECTION)

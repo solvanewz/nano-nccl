@@ -177,8 +177,8 @@ if(NANO_NCCL_ENABLE_MPI)
     add_executable(nano_nccl_ep_moe_test ep_moe_test.cu)
     target_link_libraries(nano_nccl_ep_moe_test PRIVATE nano_nccl_ep nano_nccl_exec nano_nccl_peer_shm nano_nccl_sim)
     if(NANO_NCCL_ENABLE_RDMA)
-        # --wire rdma: multi-host runs over RdmaWire.
-        target_link_libraries(nano_nccl_ep_moe_test PRIVATE nano_nccl_peer_rdma)
+        # --wire rdma / hybrid: multi-host runs over RdmaWire / HybridWire.
+        target_link_libraries(nano_nccl_ep_moe_test PRIVATE nano_nccl_peer_rdma nano_nccl_peer_hybrid)
         target_compile_definitions(nano_nccl_ep_moe_test PRIVATE NANO_NCCL_EP_RDMA_WIRE=1)
     endif()
     if(BUILD_TESTING)

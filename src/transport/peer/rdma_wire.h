@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -13,7 +14,18 @@
 
 #include <mpi.h>
 
+struct ibv_pd;
+struct ibv_mr;
+
 namespace nano_nccl::transport::peer {
+
+// Registers `bytes` of CUDA device memory at `addr` with `pd` (GPUDirect
+// RDMA: DMA-BUF or nvidia-peermem) and names the method in `*method`.
+// Returns the MR, deregistered when the last reference goes; throws when the
+// device memory cannot be registered. Injected so this library needs no CUDA
+// driver API.
+using DeviceMemoryRegistrar =
+    std::function<std::shared_ptr<ibv_mr>(ibv_pd* pd, void* addr, std::size_t bytes, std::string* method)>;
 
 struct RdmaWireConfig {
     int slots_per_link = 4;
@@ -21,11 +33,30 @@ struct RdmaWireConfig {
     // Credit writes in flight per link; releases made meanwhile are folded
     // into the next write.
     int credit_writes_in_flight = 2;
+    // GPUDirect RDMA when set: staging and receive slots live in device
+    // memory (LocalCopier::alloc_local) registered with this function, so the
+    // NIC reads and writes GPU memory and the local copies stay on the
+    // device. Chunk headers then go in host memory, written ahead of the
+    // payload by a separate (inline) RDMA WRITE on the same QP.
+    DeviceMemoryRegistrar register_device;
+    // CUDA device of the slots; GPUDirect only (receive write flush).
+    int device = 0;
 };
 
-// PeerWire over RDMA verbs (RC, one QP per remote peer), host-pinned: every
-// byte is staged through registered host memory, so no GPU memory is
-// registered with the NIC (GPUDirect is phase three).
+// PeerWire over RDMA verbs (RC, one QP per remote peer). Host-pinned by
+// default: every byte is staged through registered host memory. With
+// RdmaWireConfig::register_device (GPUDirect) the slots are device memory and
+// only the 64-byte headers and credit words stay in host memory:
+//   write_chunk  header -> host header slot (CPU), payload -> device staging
+//                slot (copier, device to device);
+//   progress     posts an RDMA WRITE of the header into the receiver's host
+//                header slot, then the WRITE_WITH_IMM of the payload; RC
+//                places them in order, so the payload's receive completion
+//                means the header is in place too. The receiver flushes
+//                GPUDirect writes (cudaDeviceFlushGPUDirectRDMAWrites) when
+//                the device does not order them natively, before the arrival
+//                is visible to copy_out.
+// Everything else is as below.
 //
 // Each slot holds a 64-byte header followed by the payload. Per remote link
 // src -> dst:
@@ -89,6 +120,10 @@ public:
     // The HCA in use and the copier, for reporting the actual backend.
     const std::string& device_name() const { return device_name_; }
     const char* copier_name() const { return copier_->name(); }
+    bool gpu_direct() const { return gdr_; }
+    // How the device slots were registered ("dmabuf", "device-verbs"), or
+    // "host" without GPUDirect.
+    const std::string& registration() const { return registration_; }
     std::uint64_t data_writes() const { return data_writes_; }
     // Per-link counters, for error messages and stall reports.
     std::string debug_state() const;
@@ -122,6 +157,8 @@ private:
     std::byte* staging_slot(int dst, std::uint64_t seq) const;
     std::byte* self_slot(std::uint64_t seq) const;
     std::uint64_t* credit_word(int dst) const;
+    ChunkHeader* tx_header(int dst, std::uint64_t seq) const;  // GPUDirect only
+    ChunkHeader* rx_header(int src, std::uint64_t seq) const;  // GPUDirect only
     std::uint64_t* credit_source(int src) const;
     void check_link(int peer, const char* what) const;
     OpId record(LocalCopier::Queue queue, std::uint64_t ticket);
@@ -139,14 +176,20 @@ private:
     std::size_t slot_stride_ = 0;
     std::size_t block_bytes_ = 0;  // one link's slots
     int credit_cap_ = 0;
+    bool gdr_ = false;
+    bool gdr_flush_ = false;  // GPUDirect receive writes need an explicit flush
+    int device_ = 0;
+    std::size_t header_offset_ = 0;  // in control_: GPUDirect header slots
     std::string device_name_;
+    std::string registration_ = "host";
 
     // Destroyed in reverse: the verbs (MRs, QPs) before the memory they
     // cover, the memory before its copier.
     std::unique_ptr<LocalCopier> copier_;
     Region recv_;     // [src] blocks; the NIC writes here
     Region staging_;  // [dst] blocks; the NIC reads here
-    Region control_;  // [dst] credit words, then [src] credit sources
+    Region control_;  // [dst] credit words, [src] credit sources; GPUDirect: then
+                      // [dst][slot] tx headers, [src][slot] rx headers
     Region self_;     // the self link's slots (alloc_local)
     std::unique_ptr<Verbs> verbs_;
 

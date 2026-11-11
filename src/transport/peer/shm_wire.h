@@ -23,6 +23,14 @@ struct ShmWireConfig {
     // completion reported before its copy finished shows up as stale data
     // instead of depending on timing luck.
     int debug_copy_delay_us = 0;
+    // Payload slots in the receiver's device memory, mapped by the senders
+    // through CUDA IPC, so a chunk is one device-to-device copy (NVLink
+    // between GPUs) instead of crossing host memory twice. Counters and
+    // headers stay in the shared host region. The caller must have checked
+    // that every pair of distinct GPUs in `comm` may use peer access (NVLink;
+    // never on hosts where peer writes are blocked by the IOMMU); ranks on the
+    // same GPU need no peer access.
+    bool device_payload = false;
 };
 
 // PeerWire between processes on one host, staged through POSIX shared
@@ -53,7 +61,10 @@ struct ShmWireConfig {
 // Each receive region is first touched on the NUMA node of its owner's GPU.
 //
 // Collective: every rank of `comm` constructs it with the same
-// slots_per_link and slot_bytes. All ranks must share one host.
+// slots_per_link, slot_bytes and device_payload. All ranks must share one
+// host. With device_payload, call finish() on every rank, then a barrier,
+// before destroying the wires: an exporter must not free its slots while a
+// peer still has them mapped.
 class ShmWire final : public PeerWire {
 public:
     ShmWire(MPI_Comm comm, const ShmWireConfig& config);
@@ -78,6 +89,10 @@ public:
 
     // Bytes of shared memory each rank allocates for its receive region.
     std::size_t region_bytes() const { return region_bytes_; }
+    bool device_payload() const { return device_payload_; }
+    // Waits for this rank's copies and unmaps the peers' device slots
+    // (device_payload); the wire must not be used afterwards.
+    void finish();
 
 private:
     struct Region;
@@ -115,6 +130,10 @@ private:
 
     std::vector<std::unique_ptr<Region>> regions_;  // indexed by owning rank
     std::byte* self_payload_ = nullptr;  // device memory, slots of the self link
+    bool device_payload_ = false;
+    std::byte* device_slots_ = nullptr;      // device_payload: this rank's [src] payload blocks
+    std::vector<std::byte*> peer_slots_;     // device_payload: each owner's blocks as mapped here
+    std::size_t device_link_bytes_ = 0;      // one link's payload slots in device memory
     cudaStream_t tx_stream_ = nullptr;
     cudaStream_t rx_stream_ = nullptr;
 

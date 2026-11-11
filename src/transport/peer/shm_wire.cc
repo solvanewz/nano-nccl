@@ -107,7 +107,8 @@ ShmWire::ShmWire(MPI_Comm comm, const ShmWireConfig& config)
     : slots_(config.slots_per_link),
       slot_bytes_(config.slot_bytes),
       device_(config.device),
-      debug_delay_us_(config.debug_copy_delay_us) {
+      debug_delay_us_(config.debug_copy_delay_us),
+      device_payload_(config.device_payload) {
     mpi_check(MPI_Comm_rank(comm, &rank_), "MPI_Comm_rank");
     mpi_check(MPI_Comm_size(comm, &nranks_), "MPI_Comm_size");
     const auto n = static_cast<std::size_t>(nranks_);
@@ -116,16 +117,18 @@ ShmWire::ShmWire(MPI_Comm comm, const ShmWireConfig& config)
     if (slots_ <= 0 || slot_bytes_ == 0) error = "slots_per_link and slot_bytes must be positive";
 
     // Every rank must use the same geometry; a mismatch would corrupt slots.
-    const std::array<std::uint64_t, 2> mine{static_cast<std::uint64_t>(config.slots_per_link),
-                                            static_cast<std::uint64_t>(config.slot_bytes)};
-    std::vector<std::array<std::uint64_t, 2>> all(n);
-    mpi_check(MPI_Allgather(mine.data(), 2, MPI_UINT64_T, all.data(), 2, MPI_UINT64_T, comm),
+    const std::array<std::uint64_t, 3> mine{static_cast<std::uint64_t>(config.slots_per_link),
+                                            static_cast<std::uint64_t>(config.slot_bytes),
+                                            config.device_payload ? 1u : 0u};
+    std::vector<std::array<std::uint64_t, 3>> all(n);
+    mpi_check(MPI_Allgather(mine.data(), 3, MPI_UINT64_T, all.data(), 3, MPI_UINT64_T, comm),
               "MPI_Allgather(ShmWire geometry)");
     for (std::size_t r = 0; r < n && error.empty(); ++r) {
         if (all[r] != all[0]) {
             error = "rank " + std::to_string(r) + " uses slots_per_link=" + std::to_string(all[r][0]) +
-                    " slot_bytes=" + std::to_string(all[r][1]) + ", rank 0 uses " +
-                    std::to_string(all[0][0]) + "/" + std::to_string(all[0][1]);
+                    " slot_bytes=" + std::to_string(all[r][1]) + " device_payload=" + std::to_string(all[r][2]) +
+                    ", rank 0 uses " + std::to_string(all[0][0]) + "/" + std::to_string(all[0][1]) + "/" +
+                    std::to_string(all[0][2]);
         }
     }
 
@@ -143,7 +146,10 @@ ShmWire::ShmWire(MPI_Comm comm, const ShmWireConfig& config)
 
     payload_offset_ = round_up(2 * kLine + static_cast<std::size_t>(slots_) * kLine, kPage);
     slot_stride_ = round_up(slot_bytes_, kSlotAlign);
-    link_bytes_ = round_up(payload_offset_ + static_cast<std::size_t>(slots_) * slot_stride_, kPage);
+    // device_payload: the host region holds only counters and headers.
+    link_bytes_ = round_up(payload_offset_ + (device_payload_ ? 0 : static_cast<std::size_t>(slots_) * slot_stride_),
+                           kPage);
+    device_link_bytes_ = static_cast<std::size_t>(slots_) * slot_stride_;
     region_bytes_ = link_bytes_ * n;
     regions_.resize(n);
 
@@ -223,6 +229,40 @@ ShmWire::ShmWire(MPI_Comm comm, const ShmWireConfig& config)
     shm_unlink(own.name.c_str());
     own.name.clear();
 
+    // Stage 3 (device_payload): export this rank's device slots, map the peers'.
+    if (device_payload_) {
+        peer_slots_.assign(n, nullptr);
+        cudaIpcMemHandle_t handle{};
+        try {
+            void* slots = nullptr;
+            CUDA_CHECK_THROW(cudaMalloc(&slots, device_link_bytes_ * n));
+            device_slots_ = static_cast<std::byte*>(slots);
+            CUDA_CHECK_THROW(cudaMemset(device_slots_, 0, device_link_bytes_ * n));
+            CUDA_CHECK_THROW(cudaIpcGetMemHandle(&handle, device_slots_));
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        agree(comm, error, "device slot allocation");
+        std::vector<cudaIpcMemHandle_t> handles(n);
+        mpi_check(MPI_Allgather(&handle, sizeof(handle), MPI_BYTE, handles.data(), sizeof(handle), MPI_BYTE, comm),
+                  "MPI_Allgather(ShmWire IPC handles)");
+        try {
+            for (int owner = 0; owner < nranks_; ++owner) {
+                if (owner == rank_) {
+                    peer_slots_[static_cast<std::size_t>(owner)] = device_slots_;
+                    continue;
+                }
+                void* mapped = nullptr;
+                CUDA_CHECK_THROW(cudaIpcOpenMemHandle(&mapped, handles[static_cast<std::size_t>(owner)],
+                                                      cudaIpcMemLazyEnablePeerAccess));
+                peer_slots_[static_cast<std::size_t>(owner)] = static_cast<std::byte*>(mapped);
+            }
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        agree(comm, error, "device slot mapping");
+    }
+
     void* self_payload = nullptr;
     CUDA_CHECK_THROW(cudaMalloc(&self_payload, static_cast<std::size_t>(slots_) * slot_stride_));
     self_payload_ = static_cast<std::byte*>(self_payload);
@@ -241,11 +281,29 @@ ShmWire::ShmWire(MPI_Comm comm, const ShmWireConfig& config)
     rx_headers_.assign(n, std::vector<ChunkHeader>(static_cast<std::size_t>(slots_)));
 }
 
+void ShmWire::finish() {
+    CUDA_CHECK_THROW(cudaSetDevice(device_));
+    CUDA_CHECK_THROW(cudaStreamSynchronize(tx_stream_));
+    CUDA_CHECK_THROW(cudaStreamSynchronize(rx_stream_));
+    for (int owner = 0; owner < static_cast<int>(peer_slots_.size()); ++owner) {
+        std::byte*& mapped = peer_slots_[static_cast<std::size_t>(owner)];
+        if (owner != rank_ && mapped != nullptr) CUDA_CHECK_THROW(cudaIpcCloseMemHandle(mapped));
+        mapped = nullptr;
+    }
+}
+
 ShmWire::~ShmWire() {
     // Copies in flight still target the mapped regions; finish them first.
     cudaSetDevice(device_);
     cudaStreamSynchronize(tx_stream_);
     cudaStreamSynchronize(rx_stream_);
+    for (int owner = 0; owner < static_cast<int>(peer_slots_.size()); ++owner) {
+        std::byte* mapped = peer_slots_[static_cast<std::size_t>(owner)];
+        if (owner != rank_ && mapped != nullptr && cudaIpcCloseMemHandle(mapped) != cudaSuccess) {
+            std::fprintf(stderr, "ShmWire: cudaIpcCloseMemHandle failed during cleanup\n");
+        }
+    }
+    if (device_slots_ != nullptr) cudaFree(device_slots_);
     for (auto& [id, op] : ops_) cudaEventDestroy(op.event);
     for (cudaEvent_t event : free_events_) cudaEventDestroy(event);
     cudaStreamDestroy(tx_stream_);
@@ -275,6 +333,11 @@ ChunkHeader* ShmWire::header_slot(int owner, int src, std::uint64_t seq) const {
 std::byte* ShmWire::payload_slot(int owner, int src, std::uint64_t seq) const {
     const auto slot = static_cast<std::size_t>(seq % static_cast<std::uint64_t>(slots_));
     if (owner == rank_ && src == rank_) return self_payload_ + slot * slot_stride_;
+    if (device_payload_) {
+        std::byte* base = peer_slots_[static_cast<std::size_t>(owner)];
+        if (base == nullptr) throw std::logic_error("ShmWire: device slots used after finish()");
+        return base + static_cast<std::size_t>(src) * device_link_bytes_ + slot * slot_stride_;
+    }
     return link_block(owner, src) + payload_offset_ + slot * slot_stride_;
 }
 

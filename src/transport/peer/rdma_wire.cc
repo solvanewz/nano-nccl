@@ -14,6 +14,7 @@
 #include <utility>
 
 #include <arpa/inet.h>
+#include <cuda_runtime.h>
 #include <infiniband/verbs.h>
 
 namespace nano_nccl::transport::peer {
@@ -25,6 +26,7 @@ constexpr std::size_t kSlotAlign = 256;
 constexpr std::size_t kLine = 64;
 constexpr std::size_t kErrorBytes = 512;
 constexpr std::uint64_t kCreditBit = std::uint64_t{1} << 63;  // wr_id of credit writes
+constexpr std::uint64_t kHeaderBit = std::uint64_t{1} << 62;  // wr_id of GPUDirect header writes (unsignaled)
 constexpr int kPollBatch = 16;
 constexpr double kDrainTimeoutSeconds = 30.0;
 constexpr double kTeardownWaitSeconds = 1.0;
@@ -70,7 +72,24 @@ struct LinkInfo {
     std::uint32_t recv_rkey = 0;
     std::uint32_t credit_rkey = 0;
     std::uint64_t credit_addr = 0;  // r's credit word of link r -> p (p writes it)
+    std::uint64_t header_addr = 0;  // GPUDirect: r's host header slots of link p -> r (control rkey)
 };
+
+// Whether NIC writes into `device`'s memory need cudaDeviceFlushGPUDirectRDMAWrites
+// before other work may read them; throws when they need one the device lacks.
+bool gdr_flush_required(int device) {
+    int ordering = 0;
+    if (cudaDeviceGetAttribute(&ordering, cudaDevAttrGPUDirectRDMAWritesOrdering, device) != cudaSuccess) {
+        throw std::runtime_error("RdmaWire: cannot query GPUDirect RDMA write ordering");
+    }
+    if (ordering >= cudaGPUDirectRDMAWritesOrderingOwner) return false;
+    int options = 0;
+    if (cudaDeviceGetAttribute(&options, cudaDevAttrGPUDirectRDMAFlushWritesOptions, device) != cudaSuccess ||
+        (options & cudaFlushGPUDirectRDMAWritesOptionHost) == 0) {
+        throw std::runtime_error("RdmaWire: GPUDirect receive needs a write flush the device does not support");
+    }
+    return true;
+}
 
 std::uint32_t initial_psn(int from, int to) {
     return (static_cast<std::uint32_t>(from) * 7919u + static_cast<std::uint32_t>(to) * 104729u + 1u) & 0xffffffu;
@@ -95,10 +114,17 @@ struct RdmaWire::Verbs {
     ibv_mr* recv_mr = nullptr;
     ibv_mr* staging_mr = nullptr;
     ibv_mr* control_mr = nullptr;
+    // GPUDirect: device registrations; recv_mr / staging_mr point into them.
+    std::shared_ptr<ibv_mr> recv_device, staging_device;
     bool inline_credits = false;
+    bool inline_headers = false;
 
     ~Verbs() {
         qps.clear();  // QPs first, then the MRs, then (endpoint) the PD
+        if (recv_device) recv_mr = nullptr;
+        if (staging_device) staging_mr = nullptr;
+        recv_device.reset();
+        staging_device.reset();
         for (ibv_mr* mr : {recv_mr, staging_mr, control_mr}) {
             if (mr != nullptr && ibv_dereg_mr(mr) != 0) std::fprintf(stderr, "RdmaWire: ibv_dereg_mr failed\n");
         }
@@ -120,6 +146,8 @@ RdmaWire::RdmaWire(MPI_Comm comm, const RdmaWireConfig& config, std::unique_ptr<
     : slots_(config.slots_per_link),
       slot_bytes_(config.slot_bytes),
       credit_cap_(config.credit_writes_in_flight),
+      gdr_(static_cast<bool>(config.register_device)),
+      device_(config.device),
       copier_(std::move(copier)) {
     mpi_check(MPI_Comm_rank(comm, &rank_), "MPI_Comm_rank");
     mpi_check(MPI_Comm_size(comm, &nranks_), "MPI_Comm_size");
@@ -134,16 +162,18 @@ RdmaWire::RdmaWire(MPI_Comm comm, const RdmaWireConfig& config, std::unique_ptr<
         error = "no local copier";
     }
     // Every rank must use the same geometry; a mismatch would corrupt slots.
-    const std::array<std::uint64_t, 2> mine{static_cast<std::uint64_t>(config.slots_per_link),
-                                            static_cast<std::uint64_t>(config.slot_bytes)};
-    std::vector<std::array<std::uint64_t, 2>> all(n);
-    mpi_check(MPI_Allgather(mine.data(), 2, MPI_UINT64_T, all.data(), 2, MPI_UINT64_T, comm),
+    // GPUDirect changes the message format, so it must match as well.
+    const std::array<std::uint64_t, 3> mine{static_cast<std::uint64_t>(config.slots_per_link),
+                                            static_cast<std::uint64_t>(config.slot_bytes), gdr_ ? 1u : 0u};
+    std::vector<std::array<std::uint64_t, 3>> all(n);
+    mpi_check(MPI_Allgather(mine.data(), 3, MPI_UINT64_T, all.data(), 3, MPI_UINT64_T, comm),
               "MPI_Allgather(RdmaWire geometry)");
     for (std::size_t r = 0; r < n && error.empty(); ++r) {
         if (all[r] != all[0]) {
             error = "rank " + std::to_string(r) + " uses slots_per_link=" + std::to_string(all[r][0]) +
-                    " slot_bytes=" + std::to_string(all[r][1]) + ", rank 0 uses " + std::to_string(all[0][0]) +
-                    "/" + std::to_string(all[0][1]);
+                    " slot_bytes=" + std::to_string(all[r][1]) + " gpudirect=" + std::to_string(all[r][2]) +
+                    ", rank 0 uses " + std::to_string(all[0][0]) + "/" + std::to_string(all[0][1]) + "/" +
+                    std::to_string(all[0][2]);
         }
     }
     agree(comm, error, "configuration");
@@ -151,7 +181,9 @@ RdmaWire::RdmaWire(MPI_Comm comm, const RdmaWireConfig& config, std::unique_ptr<
     slot_stride_ = round_up(kHeaderBytes + slot_bytes_, kSlotAlign);
     block_bytes_ = static_cast<std::size_t>(slots_) * slot_stride_;
     const std::size_t region_bytes = block_bytes_ * n;
-    const std::size_t control_bytes = 2 * n * kLine;
+    header_offset_ = 2 * n * kLine;
+    const std::size_t header_bytes = gdr_ ? 2 * n * static_cast<std::size_t>(slots_) * kHeaderBytes : 0;
+    const std::size_t control_bytes = header_offset_ + header_bytes;
 
     // Stage 1: device, memory, registrations, QPs with their receives posted.
     std::vector<LinkInfo> mine_info(n);
@@ -162,21 +194,32 @@ RdmaWire::RdmaWire(MPI_Comm comm, const RdmaWireConfig& config, std::unique_ptr<
         const char* name = ibv_get_device_name(v.endpoint.context()->device);
         device_name_ = name != nullptr ? name : "?";
 
-        recv_.allocate(copier_.get(), region_bytes, false);
-        staging_.allocate(copier_.get(), region_bytes, false);
+        recv_.allocate(copier_.get(), region_bytes, gdr_);
+        staging_.allocate(copier_.get(), region_bytes, gdr_);
         control_.allocate(copier_.get(), control_bytes, false);
         self_.allocate(copier_.get(), block_bytes_, true);
-        v.recv_mr = register_mr(v.endpoint.pd(), recv_.ptr, region_bytes, "receive slots");
-        v.staging_mr = register_mr(v.endpoint.pd(), staging_.ptr, region_bytes, "staging slots");
+        if (gdr_) {
+            gdr_flush_ = gdr_flush_required(device_);
+            v.recv_device = config.register_device(v.endpoint.pd(), recv_.ptr, region_bytes, &registration_);
+            v.staging_device = config.register_device(v.endpoint.pd(), staging_.ptr, region_bytes, &registration_);
+            if (!v.recv_device || !v.staging_device) throw std::runtime_error("RdmaWire: device registration failed");
+            v.recv_mr = v.recv_device.get();
+            v.staging_mr = v.staging_device.get();
+        } else {
+            v.recv_mr = register_mr(v.endpoint.pd(), recv_.ptr, region_bytes, "receive slots");
+            v.staging_mr = register_mr(v.endpoint.pd(), staging_.ptr, region_bytes, "staging slots");
+        }
         v.control_mr = register_mr(v.endpoint.pd(), control_.ptr, control_bytes, "credit words");
 
         v.qps.resize(n);
-        bool inline_ok = true;
+        bool inline_ok = true, inline_headers = true;
         for (int p = 0; p < nranks_; ++p) {
             if (p == rank_) continue;
             auto& qp = v.qps[static_cast<std::size_t>(p)];
-            qp = rdma::RdmaQp::create_init(v.endpoint, slots_ + credit_cap_, slots_);
+            // GPUDirect: two writes per chunk (header, payload).
+            qp = rdma::RdmaQp::create_init(v.endpoint, (gdr_ ? 2 : 1) * slots_ + credit_cap_, slots_);
             inline_ok = inline_ok && qp.max_inline_data() >= sizeof(std::uint64_t);
+            inline_headers = inline_headers && qp.max_inline_data() >= sizeof(ChunkHeader);
             for (int s = 0; s < slots_; ++s) {
                 ibv_recv_wr wr{};
                 wr.wr_id = static_cast<std::uint64_t>(p);
@@ -195,8 +238,10 @@ RdmaWire::RdmaWire(MPI_Comm comm, const RdmaWireConfig& config, std::unique_ptr<
             info.recv_rkey = v.recv_mr->rkey;
             info.credit_addr = reinterpret_cast<std::uint64_t>(control_.ptr + static_cast<std::size_t>(p) * kLine);
             info.credit_rkey = v.control_mr->rkey;
+            if (gdr_) info.header_addr = reinterpret_cast<std::uint64_t>(rx_header(p, 0));
         }
         v.inline_credits = inline_ok;
+        v.inline_headers = inline_headers;
     } catch (const std::exception& e) {
         error = e.what();
     }
@@ -288,6 +333,19 @@ std::uint64_t* RdmaWire::credit_source(int src) const {
                                             (static_cast<std::size_t>(nranks_) + static_cast<std::size_t>(src)) * kLine);
 }
 
+ChunkHeader* RdmaWire::tx_header(int dst, std::uint64_t seq) const {
+    const std::size_t slot = static_cast<std::size_t>(dst) * static_cast<std::size_t>(slots_) +
+                             static_cast<std::size_t>(seq % static_cast<std::uint64_t>(slots_));
+    return reinterpret_cast<ChunkHeader*>(control_.ptr + header_offset_ + slot * kHeaderBytes);
+}
+
+ChunkHeader* RdmaWire::rx_header(int src, std::uint64_t seq) const {
+    const std::size_t slot = (static_cast<std::size_t>(nranks_) + static_cast<std::size_t>(src)) *
+                                 static_cast<std::size_t>(slots_) +
+                             static_cast<std::size_t>(seq % static_cast<std::uint64_t>(slots_));
+    return reinterpret_cast<ChunkHeader*>(control_.ptr + header_offset_ + slot * kHeaderBytes);
+}
+
 void RdmaWire::check_link(int peer, const char* what) const {
     if (peer < 0 || peer >= nranks_) {
         throw std::invalid_argument(std::string("RdmaWire::") + what + ": peer " + std::to_string(peer) +
@@ -336,7 +394,9 @@ PeerWire::OpId RdmaWire::write_chunk(int dst, std::uint64_t seq, const ChunkHead
         ticket = copier_->copy(LocalCopier::kTx, self_slot(seq), src, bytes);
     } else {
         std::byte* slot = staging_slot(dst, seq);
-        std::memcpy(slot, &header, sizeof(ChunkHeader));
+        // GPUDirect: the slot is device memory; the header goes separately.
+        std::memcpy(gdr_ ? static_cast<void*>(tx_header(dst, seq)) : static_cast<void*>(slot), &header,
+                    sizeof(ChunkHeader));
         ticket = copier_->copy(LocalCopier::kTx, slot + kHeaderBytes, src, bytes);
     }
     tx_pending_[d].push_back({seq, ticket, bytes});
@@ -347,10 +407,8 @@ PeerWire::OpId RdmaWire::write_chunk(int dst, std::uint64_t seq, const ChunkHead
 void RdmaWire::post_data(int dst, const PendingWrite& write) {
     const auto d = static_cast<std::size_t>(dst);
     const LinkInfo& remote = verbs_->remote[d];
+    const std::uint64_t slot = write.seq % static_cast<std::uint64_t>(slots_);
     ibv_sge sge{};
-    sge.addr = reinterpret_cast<std::uint64_t>(staging_slot(dst, write.seq));
-    sge.length = static_cast<std::uint32_t>(kHeaderBytes + write.bytes);
-    sge.lkey = verbs_->staging_mr->lkey;
     ibv_send_wr wr{};
     wr.wr_id = write.seq;
     wr.sg_list = &sge;
@@ -358,11 +416,35 @@ void RdmaWire::post_data(int dst, const PendingWrite& write) {
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     wr.send_flags = IBV_SEND_SIGNALED;
     wr.imm_data = htonl(static_cast<std::uint32_t>(write.seq));
-    wr.wr.rdma.remote_addr =
-        remote.recv_addr + (write.seq % static_cast<std::uint64_t>(slots_)) * static_cast<std::uint64_t>(slot_stride_);
     wr.wr.rdma.rkey = remote.recv_rkey;
+    // Header write ahead of the payload (GPUDirect), same QP, unsignaled: the
+    // payload's completion covers it, and RC places it first.
+    ibv_sge header_sge{};
+    ibv_send_wr header_wr{};
+    if (gdr_) {
+        sge.addr = reinterpret_cast<std::uint64_t>(staging_slot(dst, write.seq) + kHeaderBytes);
+        sge.length = static_cast<std::uint32_t>(write.bytes);
+        wr.num_sge = write.bytes == 0 ? 0 : 1;
+        wr.wr.rdma.remote_addr = remote.recv_addr + slot * static_cast<std::uint64_t>(slot_stride_) + kHeaderBytes;
+        header_sge.addr = reinterpret_cast<std::uint64_t>(tx_header(dst, write.seq));
+        header_sge.length = sizeof(ChunkHeader);
+        header_sge.lkey = verbs_->control_mr->lkey;
+        header_wr.wr_id = kHeaderBit | write.seq;
+        header_wr.sg_list = &header_sge;
+        header_wr.num_sge = 1;
+        header_wr.opcode = IBV_WR_RDMA_WRITE;
+        header_wr.send_flags = verbs_->inline_headers ? IBV_SEND_INLINE : 0;
+        header_wr.wr.rdma.remote_addr = remote.header_addr + slot * kHeaderBytes;
+        header_wr.wr.rdma.rkey = remote.credit_rkey;
+        header_wr.next = &wr;
+    } else {
+        sge.addr = reinterpret_cast<std::uint64_t>(staging_slot(dst, write.seq));
+        sge.length = static_cast<std::uint32_t>(kHeaderBytes + write.bytes);
+        wr.wr.rdma.remote_addr = remote.recv_addr + slot * static_cast<std::uint64_t>(slot_stride_);
+    }
+    sge.lkey = verbs_->staging_mr->lkey;
     ibv_send_wr* bad = nullptr;
-    const int rc = ibv_post_send(verbs_->qps[d].qp(), &wr, &bad);
+    const int rc = ibv_post_send(verbs_->qps[d].qp(), gdr_ ? &header_wr : &wr, &bad);
     if (rc != 0) {
         throw std::runtime_error("RdmaWire: posting the data write of link " + std::to_string(rank_) + "->" +
                                  std::to_string(dst) + " failed: " + std::strerror(rc));
@@ -401,6 +483,7 @@ void RdmaWire::post_credit(int src) {
 
 void RdmaWire::poll_completions() {
     ibv_wc wcs[kPollBatch];
+    bool arrivals = false;
     for (int p = 0; p < nranks_; ++p) {
         if (p == rank_) continue;
         const auto i = static_cast<std::size_t>(p);
@@ -427,6 +510,7 @@ void RdmaWire::poll_completions() {
                                              " delivered more chunks than it has free slots");
                 }
                 ++rx_arrived_[i];
+                arrivals = true;
                 ibv_recv_wr wr{};
                 wr.wr_id = static_cast<std::uint64_t>(p);
                 ibv_recv_wr* bad = nullptr;
@@ -434,6 +518,8 @@ void RdmaWire::poll_completions() {
                 if (rc != 0) throw std::runtime_error(std::string("RdmaWire: ibv_post_recv failed: ") + std::strerror(rc));
             } else if (wc.opcode == IBV_WC_RDMA_WRITE && (wc.wr_id & kCreditBit) != 0) {
                 --credit_inflight_[i];
+            } else if (wc.opcode == IBV_WC_RDMA_WRITE && (wc.wr_id & kHeaderBit) != 0) {
+                // Unsignaled header writes complete only on error (above).
             } else if (wc.opcode == IBV_WC_RDMA_WRITE) {
                 if (wc.wr_id != tx_acked_[i]) {
                     throw std::runtime_error("RdmaWire: data write " + std::to_string(wc.wr_id) + " to peer " +
@@ -443,6 +529,16 @@ void RdmaWire::poll_completions() {
             } else {
                 throw std::runtime_error("RdmaWire: unexpected completion opcode " + std::to_string(wc.opcode));
             }
+        }
+    }
+    // Arrived GPUDirect payloads must be visible to the copy-outs that read
+    // them; without native ordering the device needs an explicit flush.
+    if (arrivals && gdr_flush_) {
+        const cudaError_t status = cudaDeviceFlushGPUDirectRDMAWrites(cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+                                                                      cudaFlushGPUDirectRDMAWritesToOwner);
+        if (status != cudaSuccess) {
+            throw std::runtime_error(std::string("RdmaWire: GPUDirect receive flush failed: ") +
+                                     cudaGetErrorString(status));
         }
     }
 }
@@ -491,7 +587,8 @@ const ChunkHeader& RdmaWire::slot_header(int src, std::uint64_t seq) {
     if (src == rank_) {
         copy = self_headers_[slot];
     } else {
-        std::memcpy(&copy, recv_slot(src, seq), sizeof(ChunkHeader));
+        std::memcpy(&copy, gdr_ ? static_cast<const void*>(rx_header(src, seq)) : recv_slot(src, seq),
+                    sizeof(ChunkHeader));
     }
     return copy;
 }

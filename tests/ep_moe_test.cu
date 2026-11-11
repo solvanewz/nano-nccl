@@ -40,8 +40,16 @@
 //
 // --wire shm (default): ShmWire, all ranks on one host. --wire rdma
 // (RDMA builds): RdmaWire with the CUDA copier, ranks on any hosts; the HCA
-// comes from NANO_NCCL_RDMA_IFNAME / NANO_NCCL_RDMA_GID_INDEX. Each rank
-// uses GPU (local rank % visible GPUs).
+// comes from NANO_NCCL_RDMA_IFNAME / NANO_NCCL_RDMA_GID_INDEX. --wire hybrid
+// (RDMA builds): HybridWire, same-node links --local nvlink (default; fails
+// unless every pair of the node's GPUs has NVLink P2P) or host, other links
+// --remote gdr (default; GPUDirect RDMA) or host. Each rank uses GPU
+// (local rank % visible GPUs).
+//
+//   ep_moe_test --exchange-bench [--max-bytes M] (with any --wire)
+//       uniform exchange (every rank to every rank, B bytes per peer, B from
+//       256 KiB to M by 4x): slowest rank's time per exchange, mean of 20
+//       after 5 warmup; the same table as peer_rdma_wire_test --bench.
 #include "ep/moe_layer.h"
 #include "ep/synthetic_routing.h"
 #include "exec/exec_trace.h"
@@ -50,8 +58,11 @@
 #include "transport/peer/peer_exchanger.h"
 #include "transport/peer/shm_wire.h"
 #ifdef NANO_NCCL_EP_RDMA_WIRE
+#include "transport/peer/hybrid_wire.h"
 #include "transport/peer/rdma_wire.h"
 #endif
+
+#include <chrono>
 
 #include <unistd.h>
 
@@ -665,6 +676,48 @@ int run_ffn(const FfnArgs& a) {
     return 0;
 }
 
+// Uniform exchange over the selected wire (device buffers).
+int run_exchange_bench(std::size_t max_bytes) {
+    namespace tp = nano_nccl::transport::peer;
+    using Clock = std::chrono::steady_clock;
+    const auto n = static_cast<std::size_t>(g_world);
+    DeviceArray<std::byte> send(max_bytes * n), recv(max_bytes * n);
+    cuda_check(cudaMemset(send.ptr, 1, max_bytes * n), "memset");
+    constexpr int kWarmup = 5, kIters = 20;
+    constexpr std::uint32_t kTag = 7;
+    PeerExchanger& e = *g_exchanger;
+    if (g_rank == 0) {
+        std::printf("# uniform exchange: ranks=%d slots=%d slot_bytes=%zu\n", g_world, e.slots_per_link(),
+                    e.slot_bytes());
+        std::printf("# %12s %12s %14s %14s\n", "bytes/peer", "time_us", "out_GB/s", "remote_GB/s");
+    }
+    std::uint64_t epoch = 1;
+    for (std::size_t bytes = 256 << 10; bytes <= max_bytes; bytes *= 4) {
+        const auto layout = tp::uniform_layout(g_world, bytes);
+        double total = 0;
+        for (int it = 0; it < kWarmup + kIters; ++it) {
+            MPI_Barrier(MPI_COMM_WORLD);
+            const auto t0 = Clock::now();
+            const auto id = e.exchangev_async(epoch++, kTag, layout, send.ptr, recv.ptr);
+            while (!(e.query_completion(id, tp::CompletionEvent::kSendBufferReusable) &&
+                     e.query_completion(id, tp::CompletionEvent::kReceiveSlotsReleased))) {
+                e.progress();
+            }
+            double elapsed = std::chrono::duration<double, std::micro>(Clock::now() - t0).count();
+            e.retire(id);
+            double slowest = 0;
+            MPI_Allreduce(&elapsed, &slowest, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+            if (it >= kWarmup) total += slowest;
+        }
+        const double us = total / kIters;
+        if (g_rank == 0) {
+            std::printf("  %12zu %12.2f %14.2f %14.2f\n", bytes, us, bytes * n / us / 1e3, bytes * (n - 1) / us / 1e3);
+        }
+    }
+    if (g_rank == 0) std::printf("exchange_bench=DONE\n");
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -726,12 +779,24 @@ int main(int argc, char** argv) {
             else if (arg == "--warmup") a.warmup = std::atoi(next());
             else if (arg == "--iter-stats") a.iter_stats = true;
             else if (arg == "--wire") a.wire = next();
+            else if (arg == "--local" || arg == "--remote" || arg == "--max-bytes") next();
+            else if (arg == "--exchange-bench") {}
             else throw std::invalid_argument("unknown argument " + arg);
         }
         a.slots = slots;
         a.slot_bytes = slot_bytes;
         std::unique_ptr<nano_nccl::transport::peer::PeerWire> wire;
         std::string wire_device = "shm";
+        std::string local_kind = "nvlink", remote_kind = "gdr";
+        bool exchange_bench = false;
+        std::size_t bench_max_bytes = std::size_t{64} << 20;
+        for (int i = 1; i < argc; ++i) {  // options of this block only (parsed above as well)
+            const std::string arg = argv[i];
+            if (arg == "--local" && i + 1 < argc) local_kind = argv[++i];
+            else if (arg == "--remote" && i + 1 < argc) remote_kind = argv[++i];
+            else if (arg == "--exchange-bench") exchange_bench = true;
+            else if (arg == "--max-bytes" && i + 1 < argc) bench_max_bytes = std::strtoull(argv[++i], nullptr, 0);
+        }
         if (a.wire == "shm") {
             wire = std::make_unique<ShmWire>(MPI_COMM_WORLD, ShmWireConfig{slots, slot_bytes, g_device, copy_delay_us});
         } else if (a.wire == "rdma") {
@@ -744,8 +809,28 @@ int main(int argc, char** argv) {
 #else
             throw std::invalid_argument("--wire rdma needs an RDMA build (NANO_NCCL_ENABLE_RDMA=ON)");
 #endif
+        } else if (a.wire == "hybrid") {
+#ifdef NANO_NCCL_EP_RDMA_WIRE
+            namespace tp = nano_nccl::transport::peer;
+            tp::HybridWireConfig hc;
+            hc.slots_per_link = slots;
+            hc.slot_bytes = slot_bytes;
+            hc.device = g_device;
+            hc.debug_copy_delay_us = copy_delay_us;
+            if (local_kind == "nvlink") hc.local = tp::HybridWireConfig::Local::kNvlink;
+            else if (local_kind == "host") hc.local = tp::HybridWireConfig::Local::kHost;
+            else throw std::invalid_argument("--local must be nvlink or host");
+            if (remote_kind == "gdr") hc.gpu_direct = true;
+            else if (remote_kind == "host") hc.gpu_direct = false;
+            else throw std::invalid_argument("--remote must be gdr or host");
+            auto hybrid = std::make_unique<tp::HybridWire>(MPI_COMM_WORLD, hc);
+            wire_device = hybrid->description();
+            wire = std::move(hybrid);
+#else
+            throw std::invalid_argument("--wire hybrid needs an RDMA build (NANO_NCCL_ENABLE_RDMA=ON)");
+#endif
         } else {
-            throw std::invalid_argument("--wire must be shm or rdma");
+            throw std::invalid_argument("--wire must be shm, rdma or hybrid");
         }
         {
             // Where every rank runs, as the backend actually in use.
@@ -765,11 +850,14 @@ int main(int argc, char** argv) {
             }
         }
         g_exchanger = std::make_unique<PeerExchanger>(wire.get());
-        status = ffn_mode ? run_ffn(a) : run_probe();
+        status = exchange_bench ? run_exchange_bench(bench_max_bytes) : ffn_mode ? run_ffn(a) : run_probe();
 #ifdef NANO_NCCL_EP_RDMA_WIRE
-        // No write may still be headed for a peer that tears down.
+        // No write may still be headed for a peer that tears down, and no
+        // peer may still map device slots that their owner frees.
         if (auto* rdma = dynamic_cast<nano_nccl::transport::peer::RdmaWire*>(wire.get())) rdma->drain();
+        if (auto* hybrid = dynamic_cast<nano_nccl::transport::peer::HybridWire*>(wire.get())) hybrid->finish();
 #endif
+        if (auto* shm = dynamic_cast<ShmWire*>(wire.get())) shm->finish();
         MPI_Barrier(MPI_COMM_WORLD);  // peers may still read this rank's region
         g_exchanger.reset();
         wire.reset();
