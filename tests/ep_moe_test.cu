@@ -29,8 +29,11 @@
 //       needs --cost-profile (an ep_profile/calibrated profile): its model is
 //       sim::planner_cost_model over the profile's host-staged copy rates,
 //       the same one nano_ep_sim builds, so a replay reproduces the plan;
-//       --cost-link replaces the copy rates by sim::link_rates(GBPS, 0,
-//       slot bytes, EXCHANGE_US), e.g. a fit of the measured RdmaWire rate.
+//       --cost-link GBPS[:EXCHANGE_US[:MESSAGE_US]] replaces the copy rates
+//       by sim::link_rates (e.g. a fit of the measured RdmaWire rate), and
+//       --cost-local GBPS[:MESSAGE_US] (--wire hybrid) adds the same-node
+//       links as a second fabric (sim::with_local_link). --trace - prints
+//       the trace on stdout between ==TRACE_BEGIN== / ==TRACE_END==.
 //       Prints stage times and the step timeline, and checks that the output
 //       is bit-identical to a serial (one group, no overlap) forward. With
 //       --dump, writes inputs, weights and outputs for
@@ -103,6 +106,7 @@ namespace exec = nano_nccl::exec;
 int g_rank = 0;
 int g_world = 0;
 int g_device = 0;
+int g_ranks_per_node = 0;  // HybridWire with equal, contiguous nodes; else 0
 
 void cuda_check(cudaError_t status, const char* what) {
     if (status != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
@@ -397,6 +401,9 @@ struct FfnArgs {
     int fallback_permille = -1;   // cost_aware: override the model's default
     double cost_link_gbps = 0;        // cost_aware: > 0 models the fabric as this link
     double cost_link_exchange_us = 0;  // ... with this fixed cost per exchange
+    double cost_link_message_us = 0;   // ... and this cost per message
+    double cost_local_gbps = 0;        // cost_aware: > 0 adds a local fabric within nodes (hybrid wire)
+    double cost_local_message_us = 0;
     int warmup = 2;
     bool iter_stats = false;
     std::string wire = "shm";
@@ -506,6 +513,10 @@ void write_trace(const FfnArgs& a, const EpShape& s, const MoeLayer& layer, cons
             t.ops.push_back(op);
         }
     }
+    if (a.trace == "-") {  // on stdout, for launchers on another host than rank 0
+        std::printf("==TRACE_BEGIN==\n%s==TRACE_END==\n", t.serialize().c_str());
+        return;
+    }
     t.save(a.trace);
     std::printf("trace written to %s\n", a.trace.c_str());
 }
@@ -555,11 +566,26 @@ int run_ffn(const FfnArgs& a) {
             const auto prof = nano_nccl::sim::CostProfile::load(a.cost_profile);
             // Fabric: the profile's host-staged copies (ShmWire), or a measured
             // network link (--cost-link, e.g. RdmaWire between hosts).
-            const auto fabric =
-                a.cost_link_gbps > 0
-                    ? nano_nccl::sim::link_rates(a.cost_link_gbps, 0.0, g_exchanger->slot_bytes(), a.cost_link_exchange_us)
-                    : nano_nccl::sim::copy_rates(prof, g_exchanger->slot_bytes());
+            auto fabric = a.cost_link_gbps > 0
+                              ? nano_nccl::sim::link_rates(a.cost_link_gbps, a.cost_link_message_us,
+                                                           g_exchanger->slot_bytes(), a.cost_link_exchange_us)
+                              : nano_nccl::sim::copy_rates(prof, g_exchanger->slot_bytes());
+            // --cost-local: same-node links (HybridWire) as a second fabric.
+            if (a.cost_local_gbps > 0) {
+                if (g_ranks_per_node <= 1) {
+                    throw std::invalid_argument("--cost-local needs --wire hybrid with equal, contiguous nodes");
+                }
+                fabric = nano_nccl::sim::with_local_link(fabric, g_ranks_per_node, a.cost_local_gbps,
+                                                         a.cost_local_message_us);
+            }
             auto m = nano_nccl::sim::planner_cost_model(prof, a.hidden, 1.0, fabric);
+            if (g_rank == 0) {
+                std::printf("# cost_model network %.1f ps/B, %lld ns/msg, %lld ns/exchange; local %d ranks/node "
+                            "%lld ps/B, %lld ns/msg\n",
+                            static_cast<double>(m.tx_ps_per_byte), static_cast<long long>(m.message_ns),
+                            static_cast<long long>(m.exchange_ns), m.ranks_per_node,
+                            static_cast<long long>(m.local_tx_ps_per_byte), static_cast<long long>(m.local_message_ns));
+            }
             if (a.fallback_permille >= 0) m.fallback_permille = a.fallback_permille;
             plan.cost = std::make_shared<const pl::CostModel>(m);
         }
@@ -770,11 +796,21 @@ int main(int argc, char** argv) {
             else if (arg == "--cost-profile") a.cost_profile = next();
             else if (arg == "--fallback-permille") a.fallback_permille = std::atoi(next());
             else if (arg == "--cost-link") {
-                const std::string v = next();  // GBPS[:EXCHANGE_US]
+                const std::string v = next();  // GBPS[:EXCHANGE_US[:MESSAGE_US]]
                 a.cost_link_gbps = std::atof(v.c_str());
-                const auto colon = v.find(':');
-                if (colon != std::string::npos) a.cost_link_exchange_us = std::atof(v.c_str() + colon + 1);
+                const auto c1 = v.find(':');
+                if (c1 != std::string::npos) {
+                    a.cost_link_exchange_us = std::atof(v.c_str() + c1 + 1);
+                    const auto c2 = v.find(':', c1 + 1);
+                    if (c2 != std::string::npos) a.cost_link_message_us = std::atof(v.c_str() + c2 + 1);
+                }
                 if (!(a.cost_link_gbps > 0)) throw std::invalid_argument("--cost-link needs GBPS > 0");
+            } else if (arg == "--cost-local") {
+                const std::string v = next();  // GBPS[:MESSAGE_US]
+                a.cost_local_gbps = std::atof(v.c_str());
+                const auto c1 = v.find(':');
+                if (c1 != std::string::npos) a.cost_local_message_us = std::atof(v.c_str() + c1 + 1);
+                if (!(a.cost_local_gbps > 0)) throw std::invalid_argument("--cost-local needs GBPS > 0");
             }
             else if (arg == "--warmup") a.warmup = std::atoi(next());
             else if (arg == "--iter-stats") a.iter_stats = true;
@@ -825,6 +861,7 @@ int main(int argc, char** argv) {
             else throw std::invalid_argument("--remote must be gdr or host");
             auto hybrid = std::make_unique<tp::HybridWire>(MPI_COMM_WORLD, hc);
             wire_device = hybrid->description();
+            g_ranks_per_node = hybrid->ranks_per_node();
             wire = std::move(hybrid);
 #else
             throw std::invalid_argument("--wire hybrid needs an RDMA build (NANO_NCCL_ENABLE_RDMA=ON)");

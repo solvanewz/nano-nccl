@@ -407,6 +407,45 @@ bool test_cost_model() {
     // + 5 = 17, experts until 26, combine until 43.
     msg.chunk_bytes = 1;
     check(pl::estimate_layer_ns(msg, 2, 4, hand, pl::fixed_group_plan(2, 4, 1), true, 1) == 43, "hand chunks");
+    // Both ranks on one node (ranks_per_node 2): the 2 rows go over the local
+    // fabric at 3 ns per byte and the (much slower) network carries nothing,
+    // not even per-message costs: dispatch 6, rank 1 computes until 15,
+    // combine until 21.
+    pl::CostModel two = unit;
+    two.tx_ps_per_byte = two.rx_ps_per_byte = 1000000;
+    two.message_ns = 1000;
+    two.ranks_per_node = 2;
+    two.local_tx_ps_per_byte = two.local_rx_ps_per_byte = 3000;
+    check(pl::estimate_layer_ns(two, 2, 4, hand, pl::fixed_group_plan(2, 4, 1), true, 1) == 21, "hand local fabric");
+    // A local message cost of 4 ns per peer and side: 6 + 4 = 10, 10 + 9,
+    // then 19 + 10.
+    two.local_message_ns = 4;
+    check(pl::estimate_layer_ns(two, 2, 4, hand, pl::fixed_group_plan(2, 4, 1), true, 1) == 29, "hand local messages");
+    // Asymmetric local sides, 3 ns out and 5 ns in per byte, no message cost:
+    // rank 1 receives the 2 rows until 10, computes until 19; the combine
+    // ends with rank 0 receiving them back until 29.
+    two.local_message_ns = 0;
+    two.local_rx_ps_per_byte = 5000;
+    check(pl::estimate_layer_ns(two, 2, 4, hand, pl::fixed_group_plan(2, 4, 1), true, 1) == 29, "hand local asymmetric");
+    // W = 4 as two nodes of 2, E = 4 (one expert per rank). Rank 0 sends 5
+    // rows to expert 1 (same node) and 7 to expert 2 (other node); 1 ns per
+    // byte on the network, 0 locally, 1 ns per row of compute. Dispatch: the
+    // network sides carry 7 rows (rank 0 out, rank 2 in): 7. Experts: rank 2
+    // computes 7 until 14 (rank 1: 5 until 12). Combine from 14: rank 2 sends
+    // 7 back until 21.
+    {
+        pl::CostModel nodes = unit;
+        nodes.ranks_per_node = 2;
+        std::vector<std::int64_t> n4(16, 0);
+        n4[0 * 4 + 1] = 5;
+        n4[0 * 4 + 2] = 7;
+        check(pl::estimate_layer_ns(nodes, 4, 4, n4, pl::fixed_group_plan(4, 4, 1), true, 1) == 21, "hand two nodes");
+        // Without the local fabric rank 0's send side carries all 12 rows:
+        // dispatch 12, experts until 19, and rank 0 receives 12 rows back from
+        // 19: 31.
+        nodes.ranks_per_node = 0;
+        check(pl::estimate_layer_ns(nodes, 4, 4, n4, pl::fixed_group_plan(4, 4, 1), true, 1) == 31, "hand all remote");
+    }
 
     std::mt19937_64 rng(4242);
     int incremental = 0, aware_trials = 0, fell_back = 0, beat_greedy = 0;
@@ -416,10 +455,30 @@ bool test_cost_model() {
         const int G = 1 + static_cast<int>(rng() % std::min(E, 12));
         const bool overlap = rng() % 4 != 0;
         const int L = static_cast<int>(rng() % 4);
-        const pl::CostModel m = random_cost_model(rng);
+        pl::CostModel m = random_cost_model(rng);
+        // Half the trials with a local fabric over nodes of 1, 2 or 4 ranks.
+        if (rng() % 2 == 0) {
+            const int rpns[] = {1, 2, 4};
+            const int rpn = rpns[rng() % 3];
+            if (W % rpn == 0) {
+                m.ranks_per_node = rpn;
+                m.local_tx_ps_per_byte = static_cast<std::int64_t>(rng() % 100);
+                m.local_rx_ps_per_byte = static_cast<std::int64_t>(rng() % 100);
+                m.local_message_ns = static_cast<std::int64_t>(rng() % 5000);
+            }
+        }
         std::vector<std::int64_t> counts(static_cast<std::size_t>(W) * E);
         for (auto& n : counts) n = rng() % 4 == 0 ? 0 : static_cast<std::int64_t>(rng() % (1 + rng() % 2000));
         const std::string where = "trial " + std::to_string(trial);
+        // One rank per node is no local fabric at all.
+        if (m.ranks_per_node == 1) {
+            pl::CostModel none = m;
+            none.ranks_per_node = 0;
+            const GroupPlan p = pl::random_group_plan(E, G, rng());
+            check(pl::estimate_layer_ns(m, W, E, counts, p, overlap, L) ==
+                      pl::estimate_layer_ns(none, W, E, counts, p, overlap, L),
+                  where + ": ranks_per_node 1 differs from no local fabric");
+        }
         // Incremental moves and swaps agree with a fresh estimate.
         {
             pl::PlanEvaluator ev(m, W, E, counts, overlap, L);

@@ -69,6 +69,9 @@ public:
     // and unmaps the peers' device slots.
     void finish();
 
+    // Ranks per node when every node holds the same number of consecutive
+    // ranks (the cost model's layout), else 0.
+    int ranks_per_node() const;
     bool is_local(int peer) const { return node_of_[static_cast<std::size_t>(peer)] == node_of_[static_cast<std::size_t>(rank_)]; }
     // The backend of each kind of link actually in use, e.g.
     // "local=nvlink(2 ranks) remote=rdma/gpudirect(dmabuf) mlx5_0".

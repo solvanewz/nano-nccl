@@ -41,9 +41,19 @@ public:
     int slots_per_link() const override { return f_.slots_; }
     std::size_t slot_bytes() const override { return f_.slot_bytes_; }
 
+    // Same node (HybridWire local link)?
+    bool local(int peer) const {
+        const int n = f_.config_.ranks_per_node;
+        return n > 1 && peer / n == rank_ / n;
+    }
+    // Remote chunks are staged (RdmaWire, host-pinned or GPUDirect).
+    bool staged(int peer) const {
+        return peer != rank_ && !local(peer) && (f_.config_.host_staged || f_.config_.gdr_staging);
+    }
+
     std::uint64_t released(int dst) override {
         const std::size_t l = f_.index(rank_, dst);
-        if (f_.config_.host_staged && dst != rank_) return std::min(f_.released_[l], f_.acked_[l]);
+        if (staged(dst)) return std::min(f_.released_[l], f_.acked_[l]);
         return f_.released_[l];
     }
 
@@ -77,9 +87,12 @@ public:
                 f_.host_.wake(rank_, end);
             });
             self_pending_.push_back({seq, op});
-        } else if (f_.config_.host_staged) {
-            // RdmaWire: stage into pinned host memory, then send from there.
-            const double dur = header.bytes == 0 ? 0.0 : costs().tx_remote(static_cast<double>(header.bytes));
+        } else if (staged(dst)) {
+            // RdmaWire: stage into pinned host memory (or, GPUDirect, a
+            // device slot), then send from there.
+            const double dur = header.bytes == 0              ? 0.0
+                               : f_.config_.host_staged ? costs().tx_remote(static_cast<double>(header.bytes))
+                                                        : costs().tx_self(static_cast<double>(header.bytes));
             const double start = std::max(clock + (tx_free_ <= clock ? costs().copy_latency : 0.0), tx_free_);
             tx_free_ = start + dur;
             f_.tx_stats_[rank_].busy += dur;
@@ -121,7 +134,7 @@ public:
         double& clock = f_.host_.host_clock(rank_);
         clock += costs().host_copy_out;
         // The slot is in device memory (GPUDirect) or pinned host memory (staged).
-        const bool host_slot = f_.config_.host_staged && src != rank_;
+        const bool host_slot = f_.config_.host_staged && src != rank_ && !local(src);
         const double dur = host_slot ? costs().rx_remote(static_cast<double>(bytes))
                                      : costs().rx_self(static_cast<double>(bytes));
         const double start = std::max(clock + (rx_free_ <= clock ? costs().copy_latency : 0.0), rx_free_);

@@ -503,6 +503,16 @@ void test_plan_from_counts() {
     require(m.row_bytes == 512 && m.tx_ps_per_byte == 76 && m.rx_ps_per_byte == 76 && m.message_ns == 2000 &&
                 m.chunk_bytes == (1 << 20) && m.exchange_ns == 3000,
             "cost model fabric from the copy tables");
+    require(m.ranks_per_node == 0, "no local fabric unless given");
+    // 100 Gb/s network and an 800 Gb/s local fabric between pairs of ranks:
+    // 80 and 10 ps per byte, the local message cost in ns.
+    const auto h = nano_nccl::sim::planner_cost_model(
+        prof, 256, 1.0,
+        nano_nccl::sim::with_local_link(nano_nccl::sim::link_rates(100, 1.5, 1 << 20, 4), 2, 800, 0.5));
+    require(h.tx_ps_per_byte == 80 && h.rx_ps_per_byte == 80 && h.ranks_per_node == 2 &&
+                h.local_tx_ps_per_byte == 10 && h.local_rx_ps_per_byte == 10 && h.local_message_ns == 500 &&
+                h.message_ns == 1500 && h.exchange_ns == 4000,
+            "cost model with a local link");
 }
 
 double expert_launch(const SimResult& r, int rank, int step) {

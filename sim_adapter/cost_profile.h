@@ -134,9 +134,18 @@ struct FabricRates {
     double message_us = 0;        // per message on the sending (chunk) / receiving (credit) side
     std::size_t chunk_bytes = 0;  // payload per message
     double exchange_us = 0;       // fixed per exchange
+    // A second fabric between the ranks of a node (NVLink), for nodes of
+    // ranks_per_node contiguous ranks; ranks_per_node <= 1: none.
+    int ranks_per_node = 0;
+    double local_tx_us_per_mib = 0;
+    double local_rx_us_per_mib = 0;
+    double local_message_us = 0;
 };
 // A network link of `gbps` in each direction.
 FabricRates link_rates(double gbps, double message_us, std::size_t chunk_bytes, double exchange_us);
+// `f` plus a local fabric of `gbps` per direction between the ranks of each
+// node of `ranks_per_node`.
+FabricRates with_local_link(FabricRates f, int ranks_per_node, double gbps, double message_us);
 // The profile's host-staged local copies (A40 ShmWire): a remote chunk is a
 // tx copy on the sender and an rx copy on the receiver, measured per chunk.
 FabricRates copy_rates(const CostProfile& p, std::size_t chunk_bytes);

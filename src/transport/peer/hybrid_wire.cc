@@ -206,6 +206,19 @@ HybridWire::~HybridWire() {
     if (node_comm_ != MPI_COMM_NULL) MPI_Comm_free(&node_comm_);
 }
 
+int HybridWire::ranks_per_node() const {
+    int size = 0;
+    while (size < nranks_ && node_of_[static_cast<std::size_t>(size)] == node_of_[0]) ++size;
+    if (size == 0 || nranks_ % size != 0) return 0;
+    for (int r = 0; r < nranks_; ++r) {
+        if (node_of_[static_cast<std::size_t>(r)] != node_of_[static_cast<std::size_t>(r - r % size)]) return 0;
+        if (r % size == 0 && r > 0 && node_of_[static_cast<std::size_t>(r)] == node_of_[static_cast<std::size_t>(r - 1)]) {
+            return 0;
+        }
+    }
+    return size;
+}
+
 void HybridWire::finish() {
     if (remote_) remote_->drain();
     local_->finish();

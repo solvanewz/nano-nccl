@@ -25,6 +25,13 @@
 //       from the profile and these network options (cost_model() below;
 //       --fallback-permille N, --search-passes N override its defaults);
 //       ffn runs print that model's estimate of the plan that ran.
+//       --gpus-per-node N (N > 1, W a multiple of N) models HybridWire on
+//       nodes of N GPUs: each node's GPUs share an NVSwitch node (links of
+//       --nvlink-gbps X, --nvlink-latency-us U; an NVLink bridge pair is the
+//       N = 2 case), every GPU keeps its own NIC link to the switch; same-node
+//       chunks are direct writes over NVLink, remote chunks follow RdmaWire's
+//       GPUDirect path (device staging copy, then the write) or, with
+//       --staged, the host-pinned one; cost_aware gets the local fabric.
 #include "analytical_network.h"
 #include "astra_scheduler.h"
 #include "cost_profile.h"
@@ -213,6 +220,8 @@ struct Args {
     double post_overhead_us = 0, arrival_latency_us = 0;  // NetConfig
     unsigned long long seed = 0;                           // routing sample (ep::routing_seed)
     int fallback_permille = -1, search_passes = -1;        // cost_aware model overrides (-1: default)
+    int gpus_per_node = 1;                                 // > 1: two-level topology, HybridWire semantics
+    double nvlink_gbps = 2000, nvlink_latency_us = 0.5;    // per direction, per link (GPU <-> NVSwitch)
 };
 
 // The planner's cost model for this run: profile compute (scaled like the
@@ -228,6 +237,8 @@ nano_nccl::planner::CostModel cost_model(const Args& a, const nsim::CostProfile&
         f.tx_us_per_mib = std::max(f.tx_us_per_mib, c.tx_us_per_mib * a.copy_scale);
         f.rx_us_per_mib = std::max(f.rx_us_per_mib, c.rx_us_per_mib * a.copy_scale);
     }
+    // Local fabric: two NVLink hops per path, no proxy cost (a device copy).
+    if (a.gpus_per_node > 1) f = nsim::with_local_link(f, a.gpus_per_node, a.nvlink_gbps, 0.0);
     auto m = nsim::planner_cost_model(p, hidden, a.compute_scale, f);
     if (a.fallback_permille >= 0) m.fallback_permille = a.fallback_permille;
     if (a.search_passes >= 0) m.max_passes = a.search_passes;
@@ -240,14 +251,28 @@ void write_inputs(const Args& a, std::string& topo, std::string& conf) {
     mkdir(a.out.c_str(), 0755);
     topo = a.out + "/topo.txt";
     conf = a.out + "/ns3.conf";
-    const int sw = a.world;
     {
         std::ofstream t(topo);
-        // nodes, gpus per server, nvswitches, switches, links, gpu type
-        t << a.world + 1 << " 1 0 1 " << a.world << " NONE\n" << sw << "\n";
-        char delay[64];
+        char delay[64], nv_delay[64];
         std::snprintf(delay, sizeof delay, "%.6fms", a.latency_us / 1000.0);
-        for (int r = 0; r < a.world; ++r) t << r << " " << sw << " " << a.gbps << "Gbps " << delay << " 0\n";
+        std::snprintf(nv_delay, sizeof nv_delay, "%.6fms", a.nvlink_latency_us / 1000.0);
+        if (a.gpus_per_node <= 1) {
+            const int sw = a.world;
+            // nodes, gpus per server, nvswitches, switches, links, gpu type
+            t << a.world + 1 << " 1 0 1 " << a.world << " NONE\n" << sw << "\n";
+            for (int r = 0; r < a.world; ++r) t << r << " " << sw << " " << a.gbps << "Gbps " << delay << " 0\n";
+        } else {
+            // GPUs 0..W-1, NVSwitch of node k = W + k, then the network switch.
+            const int nodes = a.world / a.gpus_per_node, sw = a.world + nodes;
+            t << sw + 1 << " " << a.gpus_per_node << " " << nodes << " 1 " << 2 * a.world << " NONE\n";
+            for (int k = 0; k < nodes; ++k) t << a.world + k << (k + 1 < nodes ? " " : "\n");
+            t << sw << "\n";
+            for (int r = 0; r < a.world; ++r) t << r << " " << sw << " " << a.gbps << "Gbps " << delay << " 0\n";
+            for (int r = 0; r < a.world; ++r) {
+                t << r << " " << a.world + r / a.gpus_per_node << " " << a.nvlink_gbps << "Gbps " << nv_delay
+                  << " 0\n";
+            }
+        }
     }
     std::ofstream(a.out + "/flow.txt") << "0\n";
     std::ofstream(a.out + "/trace.txt") << "0\n";
@@ -419,6 +444,8 @@ nsim::SimResult run_layer(const Args& a, nsim::Scheduler& sched, std::vector<Ast
                        std::vector<nsim::WireCosts> costs) -> std::unique_ptr<nsim::Fabric> {
         nsim::simai::NetConfig config;
         config.host_staged = a.staged;
+        config.gdr_staging = a.gpus_per_node > 1 && !a.staged;  // HybridWire: RdmaWire with GPUDirect
+        config.ranks_per_node = a.gpus_per_node;
         config.post_overhead = a.post_overhead_us;
         config.arrival_latency = a.arrival_latency_us;
         auto f = std::make_unique<nsim::simai::NetFabric>(s, host, world, slots, slot_bytes, std::move(costs), eps,
@@ -463,6 +490,10 @@ int report(const Args& a, const nsim::SimResult& res, const nsim::simai::NetFabr
     std::printf("# %s star: %d GPUs, %d Gb/s, %.2f us per link, %s; %d steps, %zu ops per rank\n",
                 a.backend.c_str(), static_cast<int>(res.ranks.size()), a.gbps, a.latency_us,
                 a.staged ? "host-staged" : "GPUDirect", r0.program.steps, r0.program.ops.size());
+    if (a.gpus_per_node > 1) {
+        std::printf("# nodes of %d GPUs over NVLink: %.0f Gb/s, %.2f us per link (HybridWire)\n", a.gpus_per_node,
+                    a.nvlink_gbps, a.nvlink_latency_us);
+    }
     std::printf("  route %.1f  counts %.1f  pipeline %.1f  reduce %.1f  total %.1f (us, slowest rank)\n", s.route,
                 s.counts, s.pipeline, s.reduce, s.total);
     std::printf("# network messages %llu, sends completed %llu, receives completed %llu\n",
@@ -522,6 +553,9 @@ int main(int argc, char** argv) {
             else if (arg == "--seed") a.seed = std::strtoull(next(), nullptr, 0);
             else if (arg == "--fallback-permille") a.fallback_permille = std::atoi(next());
             else if (arg == "--search-passes") a.search_passes = std::atoi(next());
+            else if (arg == "--gpus-per-node") a.gpus_per_node = std::atoi(next());
+            else if (arg == "--nvlink-gbps") a.nvlink_gbps = std::atof(next());
+            else if (arg == "--nvlink-latency-us") a.nvlink_latency_us = std::atof(next());
             else throw std::invalid_argument("unknown option " + arg);
         }
         const int speeds[] = {25, 50, 100, 200, 400, 1600};  // ECN maps of SimAI.conf
@@ -529,6 +563,13 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("--gbps must be one of 25 50 100 200 400 1600");
         }
         if (a.world < 2) throw std::invalid_argument("--world must be >= 2");
+        if (a.gpus_per_node < 1 || a.world % a.gpus_per_node != 0) {
+            throw std::invalid_argument("--gpus-per-node must divide --world");
+        }
+        if (a.gpus_per_node > 1 && a.backend != "ns3") {
+            throw std::invalid_argument("--gpus-per-node needs the ns3 backend");
+        }
+        if (!(a.nvlink_gbps > 0)) throw std::invalid_argument("--nvlink-gbps must be positive");
         if (a.backend != "ns3" && a.backend != "analytical") throw std::invalid_argument("--backend ns3|analytical");
         if (a.selftest && a.backend != "ns3") throw std::invalid_argument("--selftest runs on ns3");
         if (!a.selftest && a.profile.empty()) throw std::invalid_argument("--profile is required");

@@ -26,6 +26,11 @@
 //                    its exchanges; an exchange ends when its slowest side
 //                    does, plus a fixed exchange latency.
 //   combine(k)     = the same bytes in the other direction.
+// With CostModel::ranks_per_node > 1 the ranks of a node (contiguous blocks
+// of ranks_per_node) reach each other over a second, local fabric (NVLink):
+// every rank then has a local send and a local receive side next to its
+// network sides, each a serial resource with its own rate and per-message
+// cost, and an exchange ends when the slowest of all four is done.
 // and the issue order of exec::PipelineOptions (D0..D(L), then per step i:
 // experts of i, C(i), D(i+L+1); combines and later dispatches are issued once
 // step i's experts are done on every rank). The rank's own rows (self link)
@@ -62,6 +67,13 @@ struct CostModel {
     std::int64_t message_ns = 0;   // per message on that side (chunks out; credits back)
     std::int64_t chunk_bytes = 0;  // payload per message; 0: one message per peer
     std::int64_t exchange_ns = 0;  // fixed per exchange (latency, completion notice)
+    // Local fabric between the ranks of a node; ranks_per_node <= 1 means
+    // there is none (every peer goes through the fabric above). Same
+    // chunk_bytes; one message per local peer and per chunk.
+    int ranks_per_node = 0;
+    std::int64_t local_tx_ps_per_byte = 0;
+    std::int64_t local_rx_ps_per_byte = 0;
+    std::int64_t local_message_ns = 0;
     // cost_aware: a plan replaces the baseline (token_greedy, or fixed) only
     // when estimated this many permille faster (the estimate is not exact).
     int fallback_permille = 20;
@@ -107,27 +119,32 @@ public:
 
 private:
     std::size_t at(int group, int rank) const { return static_cast<std::size_t>(group) * world_ + rank; }
-    std::int64_t side_ps(std::int64_t rows, std::int64_t row_ps) const;
+    std::int64_t side_ps(std::int64_t rows, std::int64_t row_ps, std::int64_t base_ps) const;
+    int node(int rank) const { return rpn_ > 1 ? rank / rpn_ : rank; }
     static std::int64_t to_ns(std::int64_t ps) { return (ps + 999) / 1000; }
     void refresh_owner(std::size_t cell);
     void refresh_sender(std::size_t cell);
 
     const CostModel& m_;
-    int world_, experts_, epr_;
+    int world_, experts_, epr_, rpn_;
     bool overlap_;
     int lookahead_;
     std::vector<std::int64_t> counts_;
     std::vector<std::int64_t> rows_;       // [E] rows of expert e (sum over sources)
-    std::vector<std::int64_t> in_rows_;    // [E] rows of e from other ranks
+    std::vector<std::int64_t> in_rows_;    // [E] rows of e from ranks of other nodes
+    std::vector<std::int64_t> in_lrows_;   // [E] rows of e from other ranks of its node
     std::vector<std::int64_t> expert_ns_;  // [E] expert_ns(rows) or 0
     std::int64_t tx_row_ps_ = 0, rx_row_ps_ = 0, base_ps_ = 0, exchange_ps_ = 0;
+    std::int64_t ltx_row_ps_ = 0, lrx_row_ps_ = 0, lbase_ps_ = 0;  // local fabric
     GroupPlan plan_;
     // [G * W] aggregates of the current mapping (rows) ...
-    std::vector<std::int64_t> ffn_, step_rows_, active_, disp_tx_, disp_rx_;
+    std::vector<std::int64_t> ffn_, step_rows_, active_, disp_tx_, disp_rx_, disp_ltx_, disp_lrx_;
     // ... and their times (ps): GPU work and host issue of the step on the
-    // rank; the rank's send / receive side in the step's dispatch and combine.
-    std::vector<std::int64_t> compute_, issue_, dtx_, drx_, ctx_, crx_;
-    mutable std::vector<std::int64_t> tx_free_, rx_free_, gpu_, dispatch_end_;  // estimate() scratch
+    // rank; the rank's send / receive side in the step's dispatch and combine,
+    // network (dtx_ ...) and local (ldtx_ ...).
+    std::vector<std::int64_t> compute_, issue_, dtx_, drx_, ctx_, crx_, ldtx_, ldrx_, lctx_, lcrx_;
+    // estimate() scratch
+    mutable std::vector<std::int64_t> tx_free_, rx_free_, ltx_free_, lrx_free_, gpu_, dispatch_end_;
 };
 
 }  // namespace nano_nccl::planner

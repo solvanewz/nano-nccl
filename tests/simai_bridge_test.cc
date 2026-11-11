@@ -162,8 +162,10 @@ Run run_layer(const SimLayerConfig& c, const std::vector<std::vector<std::int64_
 }
 
 // `staged` (NetConfig::host_staged) needs the profile for the staging cost.
+// staged: remote sends go out after a staging copy (tx_remote, or tx_self with
+// device_staging); same-node peers of nodes of ranks_per_node are direct.
 void check_run(const SimLayerConfig& c, const Run& r, double gbps, double latency_us, bool staged = false,
-               const CostProfile* p = nullptr) {
+               const CostProfile* p = nullptr, int ranks_per_node = 0, bool device_staging = false) {
     const int W = c.world;
     require(r.sent == r.send_done && r.sent == r.recv_done,
             "messages sent " + std::to_string(r.sent) + ", sends completed " + std::to_string(r.send_done) +
@@ -198,10 +200,12 @@ void check_run(const SimLayerConfig& c, const Run& r, double gbps, double latenc
             for (int s = 0; s < W; ++s) {
                 if (s == d || in.recv_bytes[s] == 0) continue;
                 double cross = static_cast<double>(in.recv_bytes[s]) / bytes_per_us + latency_us;
-                if (staged) {
+                const bool same_node = ranks_per_node > 1 && s / ranks_per_node == d / ranks_per_node;
+                if (staged && !same_node) {
                     // The first chunk is staged before anything is sent.
                     const double first = static_cast<double>(std::min(in.recv_bytes[s], c.slot_bytes));
-                    cross += WireCosts::from_profile(*p, false, s).tx_remote(first);
+                    const WireCosts wc = WireCosts::from_profile(*p, false, s);
+                    cross += device_staging ? wc.tx_self(first) : wc.tx_remote(first);
                 }
                 require(at(Condition::kPayloadArrived) >= r.res.ranks[s].ops[i].issue_begin + cross - 1e-6,
                         "payload " + std::to_string(s) + "->" + std::to_string(d) + " of op " + std::to_string(i) +
@@ -404,6 +408,72 @@ void test_staged() {
                 direct.res.makespan, staged.res.makespan, early);
 }
 
+// Dispatches whose send buffer was reusable before their remote bytes could
+// have crossed the link (only a staging copy makes that possible).
+int early_frees(const SimLayerConfig& c, const Run& run, double gbps) {
+    const double bytes_per_us = gbps * 1e3 / 8.0;
+    int early = 0;
+    for (int d = 0; d < c.world; ++d) {
+        const auto& rk = run.res.ranks[d];
+        for (int i : rk.program.dispatch) {
+            const auto& in = nano_nccl::exec::exchange_layout(rk.program, i, rk.plan);
+            double out_bytes = 0;
+            for (int s = 0; s < c.world; ++s) out_bytes += s == d ? 0.0 : static_cast<double>(in.send_bytes[s]);
+            const double reusable = rk.ops[i].condition[static_cast<int>(Condition::kSendBufferReusable)];
+            if (reusable < rk.ops[i].issue_begin + out_bytes / bytes_per_us) ++early;
+        }
+    }
+    return early;
+}
+
+// HybridWire semantics: remote chunks staged in device memory (GPUDirect),
+// same-node chunks written directly.
+void test_hybrid() {
+    const CostProfile p = profile();
+    SimLayerConfig c;
+    c.world = 4;
+    c.num_experts = 16;
+    c.top_k = 2;
+    c.hidden = 1024;
+    c.ffn = 512;
+    c.plan = nano_nccl::exec::PlanSource::ahead(nano_nccl::planner::fixed_group_plan(4, 16, 4));
+    c.options = {true, 1};
+    c.slots_per_link = 4;
+    c.slot_bytes = 65536;
+    std::vector<std::vector<std::int64_t>> counts(4, std::vector<std::int64_t>(16, 256));
+    std::vector<int> tokens(4, 256 * 16 / 2);
+    const double gbps = 25, latency = 1;
+    NetConfig staged_config, pairs, one_node;
+    staged_config.host_staged = true;
+    pairs.gdr_staging = true;
+    pairs.ranks_per_node = 2;
+    one_node.gdr_staging = true;
+    one_node.ranks_per_node = 4;
+    const Run direct = run_layer(c, counts, tokens, p, gbps, latency);
+    const Run staged = run_layer(c, counts, tokens, p, gbps, latency, staged_config);
+    const Run hybrid = run_layer(c, counts, tokens, p, gbps, latency, pairs);
+    const Run local = run_layer(c, counts, tokens, p, gbps, latency, one_node);
+    check_run(c, hybrid, gbps, latency, true, &p, 2, true);
+    check_run(c, local, gbps, latency);
+    double rx_staged = 0, rx_hybrid = 0;
+    for (int d = 0; d < c.world; ++d) {
+        rx_staged += staged.res.rx[d].busy;
+        rx_hybrid += hybrid.res.rx[d].busy;
+    }
+    require(rx_hybrid * 2 < rx_staged, "GPUDirect copy-outs read host memory (rx busy " + std::to_string(rx_hybrid) +
+                                           " vs host-staged " + std::to_string(rx_staged) + " us)");
+    const int early = early_frees(c, hybrid, gbps);
+    require(early > 0, "no GPUDirect remote send buffer was freed by its staging copy");
+    // One node: every link is a direct write, exactly the plain path.
+    require(early_frees(c, local, gbps) == 0, "a same-node chunk was staged");
+    require(local.res.makespan == direct.res.makespan,
+            "one node differs from direct writes: " + std::to_string(local.res.makespan) + " vs " +
+                std::to_string(direct.res.makespan) + " us");
+    std::printf("  W=4 G4 L1 25 Gb/s: direct %.0f us, nodes of 2 (GPUDirect staging) %.0f us; %d dispatches freed "
+                "early\n",
+                direct.res.makespan, hybrid.res.makespan, early);
+}
+
 }  // namespace
 
 int main() {
@@ -413,6 +483,7 @@ int main() {
     check("credit_round_trips", test_credits);
     check("post_overhead", test_post_overhead);
     check("staged_vs_gpudirect", test_staged);
+    check("hybrid_semantics", test_hybrid);
     std::printf("simai_bridge=%s\n", g_failed == 0 ? "PASS" : "FAIL");
     return g_failed == 0 ? 0 : 1;
 }

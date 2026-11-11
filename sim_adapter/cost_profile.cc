@@ -162,6 +162,14 @@ FabricRates link_rates(double gbps, double message_us, std::size_t chunk_bytes, 
     return f;
 }
 
+FabricRates with_local_link(FabricRates f, int ranks_per_node, double gbps, double message_us) {
+    if (!(gbps > 0)) throw std::invalid_argument("with_local_link: gbps must be positive");
+    f.ranks_per_node = ranks_per_node;
+    f.local_tx_us_per_mib = f.local_rx_us_per_mib = 1048576.0 * 8 / (gbps * 1e3);
+    f.local_message_us = message_us;
+    return f;
+}
+
 FabricRates copy_rates(const CostProfile& p, std::size_t chunk_bytes) {
     if (chunk_bytes == 0) throw std::invalid_argument("copy_rates: chunk_bytes must be positive");
     const double mib = static_cast<double>(chunk_bytes) / 1048576.0;
@@ -197,6 +205,10 @@ planner::CostModel planner_cost_model(const CostProfile& p, int hidden, double c
     m.message_ns = ns(fabric.message_us);
     m.chunk_bytes = static_cast<std::int64_t>(fabric.chunk_bytes);
     m.exchange_ns = ns(fabric.exchange_us);
+    m.ranks_per_node = fabric.ranks_per_node;
+    m.local_tx_ps_per_byte = ps_per_byte(fabric.local_tx_us_per_mib);
+    m.local_rx_ps_per_byte = ps_per_byte(fabric.local_rx_us_per_mib);
+    m.local_message_ns = ns(fabric.local_message_us);
     m.validate();
     return m;
 }

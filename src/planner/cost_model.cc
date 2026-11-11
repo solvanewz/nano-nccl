@@ -34,7 +34,8 @@ void CostModel::validate() const {
     if (expert_ns.empty()) fail("no expert table");
     if (permute_ns.empty()) fail("no permute table");
     if (expert_issue_ns.empty()) fail("no expert issue table");
-    if (tx_ps_per_byte < 0 || rx_ps_per_byte < 0 || message_ns < 0 || chunk_bytes < 0 || exchange_ns < 0) {
+    if (tx_ps_per_byte < 0 || rx_ps_per_byte < 0 || message_ns < 0 || chunk_bytes < 0 || exchange_ns < 0 ||
+        ranks_per_node < 0 || local_tx_ps_per_byte < 0 || local_rx_ps_per_byte < 0 || local_message_ns < 0) {
         fail("negative fabric cost");
     }
     if (fallback_permille < 0 || fallback_permille >= 1000) fail("fallback_permille must be in [0, 1000)");
@@ -43,8 +44,8 @@ void CostModel::validate() const {
 
 PlanEvaluator::PlanEvaluator(const CostModel& model, int world, int num_experts,
                              const std::vector<std::int64_t>& counts, bool overlap, int lookahead)
-    : m_(model), world_(world), experts_(num_experts), epr_(0), overlap_(overlap), lookahead_(lookahead),
-      counts_(counts) {
+    : m_(model), world_(world), experts_(num_experts), epr_(0), rpn_(model.ranks_per_node), overlap_(overlap),
+      lookahead_(lookahead), counts_(counts) {
     model.validate();
     if (world <= 0 || num_experts <= 0 || num_experts % world != 0) {
         throw std::invalid_argument("PlanEvaluator: num_experts must be a positive multiple of world");
@@ -53,29 +54,38 @@ PlanEvaluator::PlanEvaluator(const CostModel& model, int world, int num_experts,
         throw std::invalid_argument("PlanEvaluator: counts must have world * num_experts entries");
     }
     if (lookahead < 0) throw std::invalid_argument("PlanEvaluator: negative lookahead");
+    if (rpn_ > 1 && world % rpn_ != 0) {
+        throw std::invalid_argument("PlanEvaluator: world must be a multiple of ranks_per_node");
+    }
     epr_ = num_experts / world;
     rows_.assign(static_cast<std::size_t>(num_experts), 0);
     in_rows_.assign(static_cast<std::size_t>(num_experts), 0);
+    in_lrows_.assign(static_cast<std::size_t>(num_experts), 0);
     expert_ns_.assign(static_cast<std::size_t>(num_experts), 0);
     for (int e = 0; e < num_experts; ++e) {
         const int owner = e / epr_;
         for (int s = 0; s < world; ++s) {
             const std::int64_t n = counts_[static_cast<std::size_t>(s) * num_experts + e];
             rows_[e] += n;
-            if (s != owner) in_rows_[e] += n;
+            if (s == owner) continue;
+            (node(s) == node(owner) ? in_lrows_ : in_rows_)[e] += n;
         }
         expert_ns_[e] = rows_[e] > 0 ? m_.expert_ns(rows_[e]) : 0;
     }
     // Per row on each side: its bytes at the side's rate plus its share of
     // the per-message cost (one message per chunk_bytes); per exchange and
     // side: one message to or from each peer.
-    auto row_ps = [&](std::int64_t ps_per_byte) {
-        const std::int64_t share = m_.chunk_bytes > 0 ? 1000 * m_.message_ns * m_.row_bytes / m_.chunk_bytes : 0;
+    auto row_ps = [&](std::int64_t ps_per_byte, std::int64_t message_ns) {
+        const std::int64_t share = m_.chunk_bytes > 0 ? 1000 * message_ns * m_.row_bytes / m_.chunk_bytes : 0;
         return m_.row_bytes * ps_per_byte + share;
     };
-    tx_row_ps_ = row_ps(m_.tx_ps_per_byte);
-    rx_row_ps_ = row_ps(m_.rx_ps_per_byte);
-    base_ps_ = 1000 * m_.message_ns * (world - 1);
+    tx_row_ps_ = row_ps(m_.tx_ps_per_byte, m_.message_ns);
+    rx_row_ps_ = row_ps(m_.rx_ps_per_byte, m_.message_ns);
+    const int local_peers = rpn_ > 1 ? rpn_ - 1 : 0;
+    base_ps_ = 1000 * m_.message_ns * (world - 1 - local_peers);
+    ltx_row_ps_ = row_ps(m_.local_tx_ps_per_byte, m_.local_message_ns);
+    lrx_row_ps_ = row_ps(m_.local_rx_ps_per_byte, m_.local_message_ns);
+    lbase_ps_ = 1000 * m_.local_message_ns * local_peers;
     exchange_ps_ = 1000 * m_.exchange_ns;
 }
 
@@ -83,8 +93,8 @@ void PlanEvaluator::load(const GroupPlan& plan) {
     validate_group_plan(plan, experts_);
     plan_ = plan;
     const std::size_t n = static_cast<std::size_t>(plan.groups()) * world_;
-    for (auto* v : {&ffn_, &step_rows_, &active_, &disp_tx_, &disp_rx_, &compute_, &issue_, &dtx_, &drx_, &ctx_,
-                    &crx_}) {
+    for (auto* v : {&ffn_, &step_rows_, &active_, &disp_tx_, &disp_rx_, &disp_ltx_, &disp_lrx_, &compute_, &issue_,
+                    &dtx_, &drx_, &ctx_, &crx_, &ldtx_, &ldrx_, &lctx_, &lcrx_}) {
         v->assign(n, 0);
     }
     for (int e = 0; e < experts_; ++e) {
@@ -94,8 +104,11 @@ void PlanEvaluator::load(const GroupPlan& plan) {
         step_rows_[k] += rows_[e];
         active_[k] += rows_[e] > 0 ? 1 : 0;
         disp_rx_[k] += in_rows_[e];
+        disp_lrx_[k] += in_lrows_[e];
         for (int s = 0; s < world_; ++s) {
-            if (s != owner) disp_tx_[at(g, s)] += counts_[static_cast<std::size_t>(s) * experts_ + e];
+            if (s == owner) continue;
+            (node(s) == node(owner) ? disp_ltx_ : disp_tx_)[at(g, s)] +=
+                counts_[static_cast<std::size_t>(s) * experts_ + e];
         }
     }
     for (std::size_t k = 0; k < n; ++k) {
@@ -104,8 +117,8 @@ void PlanEvaluator::load(const GroupPlan& plan) {
     }
 }
 
-std::int64_t PlanEvaluator::side_ps(std::int64_t rows, std::int64_t row_ps) const {
-    return rows * row_ps + base_ps_;
+std::int64_t PlanEvaluator::side_ps(std::int64_t rows, std::int64_t row_ps, std::int64_t base_ps) const {
+    return rows * row_ps + base_ps;
 }
 
 // The owner's cell: its compute, and what it receives in the dispatch and
@@ -113,14 +126,18 @@ std::int64_t PlanEvaluator::side_ps(std::int64_t rows, std::int64_t row_ps) cons
 void PlanEvaluator::refresh_owner(std::size_t k) {
     compute_[k] = 1000 * (2 * m_.permute_ns(step_rows_[k]) + ffn_[k]);
     issue_[k] = 1000 * m_.expert_issue_ns(active_[k]);
-    drx_[k] = side_ps(disp_rx_[k], rx_row_ps_);
-    ctx_[k] = side_ps(disp_rx_[k], tx_row_ps_);
+    drx_[k] = side_ps(disp_rx_[k], rx_row_ps_, base_ps_);
+    ctx_[k] = side_ps(disp_rx_[k], tx_row_ps_, base_ps_);
+    ldrx_[k] = side_ps(disp_lrx_[k], lrx_row_ps_, lbase_ps_);
+    lctx_[k] = side_ps(disp_lrx_[k], ltx_row_ps_, lbase_ps_);
 }
 
 // A source's cell: what it sends in the dispatch and gets back in the combine.
 void PlanEvaluator::refresh_sender(std::size_t k) {
-    dtx_[k] = side_ps(disp_tx_[k], tx_row_ps_);
-    crx_[k] = side_ps(disp_tx_[k], rx_row_ps_);
+    dtx_[k] = side_ps(disp_tx_[k], tx_row_ps_, base_ps_);
+    crx_[k] = side_ps(disp_tx_[k], rx_row_ps_, base_ps_);
+    ldtx_[k] = side_ps(disp_ltx_[k], ltx_row_ps_, lbase_ps_);
+    lcrx_[k] = side_ps(disp_ltx_[k], lrx_row_ps_, lbase_ps_);
 }
 
 void PlanEvaluator::move(int e, int group) {
@@ -133,11 +150,12 @@ void PlanEvaluator::move(int e, int group) {
         step_rows_[k] += sign * rows_[e];
         active_[k] += sign * (rows_[e] > 0 ? 1 : 0);
         disp_rx_[k] += sign * in_rows_[e];
+        disp_lrx_[k] += sign * in_lrows_[e];
         refresh_owner(k);
         for (int s = 0; s < world_; ++s) {
             const std::int64_t n = counts_[static_cast<std::size_t>(s) * experts_ + e];
             if (s == owner || n == 0) continue;
-            disp_tx_[at(g, s)] += sign * n;
+            (node(s) == node(owner) ? disp_ltx_ : disp_tx_)[at(g, s)] += sign * n;
             refresh_sender(at(g, s));
         }
     };
@@ -154,8 +172,15 @@ std::pair<int, int> PlanEvaluator::busiest_compute_cell() const {
 }
 
 std::pair<int, int> PlanEvaluator::busiest_receive_cell() const {
-    const std::size_t k = static_cast<std::size_t>(std::max_element(disp_rx_.begin(), disp_rx_.end()) - disp_rx_.begin());
-    return {static_cast<int>(k / world_), static_cast<int>(k % world_)};
+    // By receive time over both fabrics (rows alone when there is one).
+    std::size_t best = 0;
+    for (std::size_t k = 1; k < drx_.size(); ++k) {
+        if (std::max(drx_[k], ldrx_[k]) > std::max(drx_[best], ldrx_[best])) best = k;
+    }
+    if (rpn_ <= 1) {
+        best = static_cast<std::size_t>(std::max_element(disp_rx_.begin(), disp_rx_.end()) - disp_rx_.begin());
+    }
+    return {static_cast<int>(best / world_), static_cast<int>(best % world_)};
 }
 
 std::int64_t PlanEvaluator::estimate(std::int64_t bound_ns) const {
@@ -164,22 +189,31 @@ std::int64_t PlanEvaluator::estimate(std::int64_t bound_ns) const {
     const std::int64_t bound = bound_ns == kNoBound ? kNoBound : bound_ns * 1000;
     tx_free_.assign(W, 0);
     rx_free_.assign(W, 0);
+    ltx_free_.assign(W, 0);
+    lrx_free_.assign(W, 0);
     gpu_.assign(W, 0);
     dispatch_end_.assign(static_cast<std::size_t>(G), 0);
     // Every time computed below is a lower bound of the result (each feeds a
     // later combine through a maximum), so a value past `bound` ends the run.
-    auto exchange = [&](std::int64_t issue, const std::int64_t* tx, const std::int64_t* rx) {
+    const bool local = rpn_ > 1;
+    auto exchange = [&](std::int64_t issue, const std::int64_t* tx, const std::int64_t* rx, const std::int64_t* ltx,
+                        const std::int64_t* lrx) {
         std::int64_t end = issue;
         for (int r = 0; r < W; ++r) {
             tx_free_[r] = std::max(issue, tx_free_[r]) + tx[r];
             rx_free_[r] = std::max(issue, rx_free_[r]) + rx[r];
             end = std::max({end, tx_free_[r], rx_free_[r]});
+            if (local) {
+                ltx_free_[r] = std::max(issue, ltx_free_[r]) + ltx[r];
+                lrx_free_[r] = std::max(issue, lrx_free_[r]) + lrx[r];
+                end = std::max({end, ltx_free_[r], lrx_free_[r]});
+            }
         }
         return end + exchange_ps_;
     };
     auto dispatch = [&](int i, std::int64_t issue) {
         const std::size_t k = at(plan_.order[i], 0);
-        dispatch_end_[i] = exchange(issue, &dtx_[k], &drx_[k]);
+        dispatch_end_[i] = exchange(issue, &dtx_[k], &drx_[k], &ldtx_[k], &ldrx_[k]);
     };
     auto experts = [&](int i) {
         const std::size_t k = at(plan_.order[i], 0);
@@ -193,7 +227,7 @@ std::int64_t PlanEvaluator::estimate(std::int64_t bound_ns) const {
     // Back to the sources: each owner sends what it received.
     auto combine = [&](int i, std::int64_t issue) {
         const std::size_t k = at(plan_.order[i], 0);
-        return exchange(issue, &ctx_[k], &crx_[k]);
+        return exchange(issue, &ctx_[k], &crx_[k], &lctx_[k], &lcrx_[k]);
     };
     std::int64_t total = 0;
     if (!overlap_) {

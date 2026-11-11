@@ -51,6 +51,16 @@
 //                             its send completed;
 //   copy_out               -> host -> device on the rx engine (rx_remote).
 //
+// With NetConfig::gdr_staging (HybridWire's RdmaWire with GPUDirect) the
+// remote path has the same staged semantics, but both local copies stay in
+// device memory (tx_self / rx_self costs).
+//
+// With NetConfig::ranks_per_node > 1 the peers of a rank's node (contiguous
+// blocks of ranks) are HybridWire's local links (ShmWire with device slots
+// over NVLink): one direct write to the receiver's device slot, i.e. the
+// plain path above, whatever the remote path is; the network backend carries
+// them over its intra-node links (SimAI's NVSwitch nodes).
+//
 // Network transfers themselves do not occupy the PCIe copy engines, so
 // remote_busy() is 0: no GPU slowdown from them.
 namespace nano_nccl::sim::simai {
@@ -65,6 +75,8 @@ struct NetConfig {
     // build, doorbell). 0: messages go to the network at their issue time.
     double post_overhead = 0;
     bool host_staged = false;    // RdmaWire semantics (see above), else GPUDirect write
+    bool gdr_staging = false;    // staged semantics with device-memory copies (see above)
+    int ranks_per_node = 0;      // > 1: same-node peers are direct (NVLink) writes
 };
 
 class NetFabric final : public Fabric {
