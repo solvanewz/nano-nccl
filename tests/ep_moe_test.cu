@@ -1,6 +1,6 @@
-// EP MoE layer over ShmWire (B1), one process per rank under mpirun.
+// EP MoE layer over ShmWire or RdmaWire (B1), one process per rank under mpirun.
 //
-//   ep_moe_test [--slots S] [--slot-bytes B] [--copy-delay-us D]
+//   ep_moe_test [--wire shm|rdma] [--slots S] [--slot-bytes B] [--copy-delay-us D]
 //       probe matrix: experts scale rows by powers of two, so every output
 //       is checked bit-exactly against a host reference. Covers skewed
 //       routing, ranks with no tokens, all tokens routed to one rank's
@@ -31,7 +31,14 @@
 //       Prints stage times and the step timeline, and checks that the output
 //       is bit-identical to a serial (one group, no overlap) forward. With
 //       --dump, writes inputs, weights and outputs for
-//       tests/ep_moe_reference.py.
+//       tests/ep_moe_reference.py. --warmup W untimed forwards (default 2);
+//       --iter-stats prints one "iter," line per timed forward and rank
+//       (stage times, exposed communication wait; see iter_stats()).
+//
+// --wire shm (default): ShmWire, all ranks on one host. --wire rdma
+// (RDMA builds): RdmaWire with the CUDA copier, ranks on any hosts; the HCA
+// comes from NANO_NCCL_RDMA_IFNAME / NANO_NCCL_RDMA_GID_INDEX. Each rank
+// uses GPU (local rank % visible GPUs).
 #include "ep/moe_layer.h"
 #include "ep/synthetic_routing.h"
 #include "exec/exec_trace.h"
@@ -39,8 +46,14 @@
 #include "planner/scheduler.h"
 #include "transport/peer/peer_exchanger.h"
 #include "transport/peer/shm_wire.h"
+#ifdef NANO_NCCL_EP_RDMA_WIRE
+#include "transport/peer/rdma_wire.h"
+#endif
+
+#include <unistd.h>
 
 #include <algorithm>
+#include <utility>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -70,6 +83,7 @@ using nano_nccl::planner::GroupPlan;
 using nano_nccl::ep::probe_scale;
 using nano_nccl::transport::peer::PeerExchanger;
 using nano_nccl::transport::peer::ShmWire;
+using nano_nccl::transport::peer::ShmWireConfig;
 namespace exec = nano_nccl::exec;
 
 int g_rank = 0;
@@ -367,7 +381,67 @@ struct FfnArgs {
     std::size_t slot_bytes = 0;
     std::string cost_profile;     // cost_aware: profile for its cost model
     int fallback_permille = -1;   // cost_aware: override the model's default
+    int warmup = 2;
+    bool iter_stats = false;
+    std::string wire = "shm";
 };
+
+// Measure of the union of [begin, end) intervals.
+double union_length(std::vector<std::pair<double, double>> v) {
+    std::sort(v.begin(), v.end());
+    double total = 0, lo = 0, hi = -1;
+    for (const auto& [b, e] : v) {
+        if (e <= b) continue;
+        if (b > hi) {
+            if (hi > lo) total += hi - lo;
+            lo = b;
+            hi = e;
+        } else {
+            hi = std::max(hi, e);
+        }
+    }
+    if (hi > lo) total += hi - lo;
+    return total;
+}
+
+// Measure of union(a) minus union(b).
+double exposed_length(const std::vector<std::pair<double, double>>& a, std::vector<std::pair<double, double>> b) {
+    std::vector<std::pair<double, double>> both = a;
+    both.insert(both.end(), b.begin(), b.end());
+    return union_length(both) - union_length(std::move(b));
+}
+
+constexpr int kIterFields = 12;
+const char* const kIterNames[kIterFields] = {"total", "route", "counts", "plan", "pack", "pipeline", "reduce",
+                                             "comm_wait", "dispatch", "combine", "expert_busy", "recv_rows"};
+
+// One forward on this rank, in us. comm_wait: time during which at least one
+// exchange (counts, dispatch, combine; issue .. consumer readable) is in
+// flight and no compute is (stream ops: route, pack, expert, reduce, issue ..
+// observed done; host plan op), i.e. communication not hidden behind work.
+// dispatch / combine: sums of their exchanges' issue .. readable times;
+// expert_busy: union of the expert ops.
+std::vector<double> iter_stats(const ForwardTimes& t, const exec::LayerProgram& prog, std::int64_t recv_rows) {
+    std::vector<std::pair<double, double>> comm, work, expert;
+    double dispatch = 0, combine = 0;
+    for (std::size_t i = 0; i < prog.ops.size() && i < t.ops.size(); ++i) {
+        const auto& o = t.ops[i];
+        if (o.issue_begin < 0) continue;
+        const double end = o.complete >= 0 ? o.complete : o.issue_end;
+        if (end < 0) continue;
+        const exec::OpKind kind = prog.ops[i].kind;
+        if (prog.ops[i].queue == exec::Queue::kExchange) {
+            comm.emplace_back(o.issue_begin, end);
+            if (kind == exec::OpKind::kDispatch) dispatch += end - o.issue_begin;
+            if (kind == exec::OpKind::kCombine) combine += end - o.issue_begin;
+        } else if (kind != exec::OpKind::kRetire) {
+            work.emplace_back(o.issue_begin, end);
+            if (kind == exec::OpKind::kExpert) expert.emplace_back(o.issue_begin, end);
+        }
+    }
+    return {t.total, t.route, t.counts, t.plan, t.pack, t.pipeline, t.reduce, exposed_length(comm, work),
+            dispatch, combine, union_length(expert), static_cast<double>(recv_rows)};
+}
 
 // Gathers every rank's counts, stage means and last-iteration op times.
 void write_trace(const FfnArgs& a, const EpShape& s, const MoeLayer& layer, const ForwardTimes& last,
@@ -387,7 +461,7 @@ void write_trace(const FfnArgs& a, const EpShape& s, const MoeLayer& layer, cons
     if (g_rank != 0) return;
     exec::LayerTrace t;
     t.key = exec::ProfileKey{g_world, s.num_experts, s.top_k, s.hidden, s.ffn, a.tokens, nano_nccl::ep::parse_workload(a.workload, a.skew).name(), a.skew,
-                             "bf16", "ffn", "shm", a.slots, a.slot_bytes};
+                             "bf16", "ffn", a.wire, a.slots, a.slot_bytes};
     t.groups = layer.last_ep_plan().groups;  // the plan that ran
     t.timing = source.timing;
     t.scheduler = source.scheduler;
@@ -475,13 +549,21 @@ int run_ffn(const FfnArgs& a) {
     constexpr int kStages = 7;
     double sum[kStages] = {};
     ForwardTimes last;
-    const int warmup = 2;
+    const int warmup = a.warmup;
     std::uint64_t epoch = 1;
+    std::vector<double> iter_rows;  // rank 0: [iters][world][kIterFields]
+    if (a.iter_stats && g_rank == 0) iter_rows.resize(static_cast<std::size_t>(a.iters) * g_world * kIterFields);
     for (int it = 0; it < warmup + a.iters; ++it) {
         MPI_Barrier(MPI_COMM_WORLD);
         const ForwardTimes t =
             layer.forward(epoch++, dx.ptr, a.tokens, dids.ptr, dw.ptr, dout.ptr, plan, options, stream);
         if (it < warmup) continue;
+        if (a.iter_stats) {
+            const auto mine = iter_stats(t, layer.last_program(), layer.last_plan().recv_rows);
+            double* dst = g_rank == 0 ? iter_rows.data() + static_cast<std::size_t>(it - warmup) * g_world * kIterFields
+                                      : nullptr;
+            MPI_Gather(mine.data(), kIterFields, MPI_DOUBLE, dst, kIterFields, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+        }
         const double v[kStages] = {t.route, t.counts, t.pipeline, t.reduce, t.total, t.plan, t.pack};
         for (int i = 0; i < kStages; ++i) sum[i] += v[i];
         last = t;
@@ -529,6 +611,20 @@ int run_ffn(const FfnArgs& a) {
                         t.expert_launched, t.expert_done, t.combine_issued, t.combine_readable);
         }
         std::printf("bitwise identical to serial: %s\n", all_same ? "yes" : "NO");
+        if (a.iter_stats) {
+            std::printf("iter_header,iter,rank");
+            for (const char* n : kIterNames) std::printf(",%s", n);
+            std::printf("\n");
+            for (int it = 0; it < a.iters; ++it) {
+                for (int r = 0; r < g_world; ++r) {
+                    const double* v = iter_rows.data() + (static_cast<std::size_t>(it) * g_world + r) * kIterFields;
+                    std::printf("iter,%d,%d", it, r);
+                    for (int f = 0; f < kIterFields; ++f) std::printf(",%.2f", v[f]);
+                    std::printf("\n");
+                }
+            }
+        }
+        std::fflush(stdout);
     }
     if (!all_same) throw std::runtime_error("pipelined output differs from the serial forward");
 
@@ -610,15 +706,56 @@ int main(int argc, char** argv) {
             else if (arg == "--trace") a.trace = next();
             else if (arg == "--cost-profile") a.cost_profile = next();
             else if (arg == "--fallback-permille") a.fallback_permille = std::atoi(next());
+            else if (arg == "--warmup") a.warmup = std::atoi(next());
+            else if (arg == "--iter-stats") a.iter_stats = true;
+            else if (arg == "--wire") a.wire = next();
             else throw std::invalid_argument("unknown argument " + arg);
         }
         a.slots = slots;
         a.slot_bytes = slot_bytes;
-        ShmWire wire(MPI_COMM_WORLD, {slots, slot_bytes, g_device, copy_delay_us});
-        g_exchanger = std::make_unique<PeerExchanger>(&wire);
+        std::unique_ptr<nano_nccl::transport::peer::PeerWire> wire;
+        std::string wire_device = "shm";
+        if (a.wire == "shm") {
+            wire = std::make_unique<ShmWire>(MPI_COMM_WORLD, ShmWireConfig{slots, slot_bytes, g_device, copy_delay_us});
+        } else if (a.wire == "rdma") {
+#ifdef NANO_NCCL_EP_RDMA_WIRE
+            namespace tp = nano_nccl::transport::peer;
+            auto rdma = std::make_unique<tp::RdmaWire>(MPI_COMM_WORLD, tp::RdmaWireConfig{slots, slot_bytes, 2},
+                                                       tp::make_cuda_copier(g_device, copy_delay_us));
+            wire_device = rdma->device_name() + "/" + rdma->copier_name();
+            wire = std::move(rdma);
+#else
+            throw std::invalid_argument("--wire rdma needs an RDMA build (NANO_NCCL_ENABLE_RDMA=ON)");
+#endif
+        } else {
+            throw std::invalid_argument("--wire must be shm or rdma");
+        }
+        {
+            // Where every rank runs, as the backend actually in use.
+            char host[256] = {};
+            gethostname(host, sizeof(host) - 1);
+            cudaDeviceProp prop{};
+            cuda_check(cudaGetDeviceProperties(&prop, g_device), "cudaGetDeviceProperties");
+            char line[512];
+            std::snprintf(line, sizeof(line), "rank %d host %s local_rank %d device %d (%s, sm_%d%d) wire %s %s",
+                          g_rank, host, local_rank, g_device, prop.name, prop.major, prop.minor, a.wire.c_str(),
+                          wire_device.c_str());
+            std::vector<char> all(g_rank == 0 ? sizeof(line) * g_world : 1);
+            MPI_Gather(line, sizeof(line), MPI_CHAR, all.data(), sizeof(line), MPI_CHAR, 0, MPI_COMM_WORLD);
+            if (g_rank == 0) {
+                for (int r = 0; r < g_world; ++r) std::printf("# %s\n", all.data() + r * sizeof(line));
+                std::fflush(stdout);
+            }
+        }
+        g_exchanger = std::make_unique<PeerExchanger>(wire.get());
         status = ffn_mode ? run_ffn(a) : run_probe();
+#ifdef NANO_NCCL_EP_RDMA_WIRE
+        // No write may still be headed for a peer that tears down.
+        if (auto* rdma = dynamic_cast<nano_nccl::transport::peer::RdmaWire*>(wire.get())) rdma->drain();
+#endif
         MPI_Barrier(MPI_COMM_WORLD);  // peers may still read this rank's region
         g_exchanger.reset();
+        wire.reset();
     } catch (const std::exception& error) {
         std::printf("rank %d error: %s\n", g_rank, error.what());
         std::fflush(stdout);
